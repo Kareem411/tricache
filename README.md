@@ -356,42 +356,42 @@ Measured on a single Node.js thread (no `await` on synchronous paths):
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — hot hit (8K entries) | 1.37 M/s | 730 ns | bloom → Map lookup |
-| `get` — cold miss | 6.61 M/s | 151 ns | bloom gates → early return |
-| `set` — tiny payload | 1.16 M/s | 863 ns | pack() + Map.set + bloom.add |
-| `set` — small payload (≈ 512 B) | 641 K/s | 1.56 µs | pack() same unified path, larger payload |
-| `set` — large payload (≥ 512 B) | 215 K/s | 4.65 µs | pack() larger payload |
-| `set` — CRITICAL priority | 801 K/s | 1.25 µs | same set path; skipped in eviction sort |
-| `delete` — exact key | 4.43 M/s | 226 ns | Map.delete |
-| `deletePattern` — glob wildcard | 7.2 K/s | 139 µs | O(n) Map scan |
+| `get` — hot hit (8K entries) | 1.24 M/s | 807 ns | bloom → Map lookup |
+| `get` — cold miss | 7.32 M/s | 137 ns | bloom gates → early return |
+| `set` — tiny payload | 1.03 M/s | 974 ns | pack() + Map.set + bloom.add |
+| `set` — small payload (≈ 512 B) | 519 K/s | 1.93 µs | pack() same unified path, larger payload |
+| `set` — large payload (≥ 512 B) | 225 K/s | 4.44 µs | pack() larger payload |
+| `set` — CRITICAL priority | 693 K/s | 1.44 µs | same set path; skipped in eviction sort |
+| `delete` — exact key | 3.08 M/s | 325 ns | Map.delete |
+| `deletePattern` — glob wildcard | 7.1 K/s | 141 µs | O(n) Map scan |
 
 **CacheService (end-to-end)**
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — L1 warm hit | 1.72 M/s | 581 ns | inflight check → l1.get |
-| `get` — SWR stale serve | 1.04 M/s | 960 ns | serves stale; revalidates async |
-| `get` — miss + fetchFn | 19.9 K/s | 50.2 µs | Promise microtask + l1.set |
-| `set` | 35.5 K/s | 28.2 µs | l1.set + disk.save (fire-and-forget) |
-| `delete` — exact key | 28.9 K/s | 34.6 µs | l1.delete + disk.delete + backplane |
-| `delete` — glob `*` | 686 K/s | 1.46 µs | l1.deletePattern O(n) + disk glob |
+| `get` — L1 warm hit | 1.39 M/s | 720 ns | inflight check → l1.get |
+| `get` — SWR stale serve | 1.34 M/s | 744 ns | serves stale; revalidates async |
+| `get` — miss + fetchFn | 17.8 K/s | 56.2 µs | Promise microtask + l1.set |
+| `set` | 28.3 K/s | 35.3 µs | l1.set + disk.save (fire-and-forget) |
+| `delete` — exact key | 29.7 K/s | 33.6 µs | l1.delete + disk.delete + backplane |
+| `delete` — glob `*` | 723 K/s | 1.38 µs | l1.deletePattern O(n) + disk glob |
 
 **Encryption** (IV pool, pre-allocated output buffers)
 
 | Mode | Payload | Encrypt | Decrypt |
 |---|---|---|---|
-| AES-256-GCM | 64 B | 125 K/s / 7.99 µs | 148 K/s / 6.78 µs |
-| AES-256-GCM | 512 B | 95.5 K/s / 10.5 µs | 134 K/s / 7.45 µs |
-| AES-256-GCM | 4 KB | 50.4 K/s / 19.8 µs | 46.7 K/s / 21.4 µs |
-| AES-128-GCM | 64 B | 130 K/s / 7.69 µs | 159 K/s / 6.28 µs |
-| AES-128-GCM | 512 B | 131 K/s / 7.65 µs | 137 K/s / 7.30 µs |
-| AES-128-GCM | 4 KB | 51.1 K/s / 19.6 µs | 50.0 K/s / 20.0 µs |
-| AES-128-CTR | 64 B | 192 K/s / 5.21 µs | 202 K/s / 4.95 µs |
-| AES-128-CTR | 512 B | 181 K/s / 5.53 µs | 187 K/s / 5.34 µs |
-| AES-128-CTR | 4 KB | 74.9 K/s / 13.4 µs | 59.3 K/s / 16.9 µs |
-| XOR _(obfuscation only)_ | 64 B | 1.68 M/s / 594 ns | 1.62 M/s / 618 ns |
-| XOR _(obfuscation only)_ | 512 B | 525 K/s / 1.91 µs | 850 K/s / 1.18 µs |
-| XOR _(obfuscation only)_ | 4 KB | 97.9 K/s / 10.2 µs | 158 K/s / 6.32 µs |
+| AES-256-GCM | 64 B | 129 K/s / 7.78 µs | 147 K/s / 6.80 µs |
+| AES-256-GCM | 512 B | 120 K/s / 8.33 µs | 103 K/s / 9.72 µs |
+| AES-256-GCM | 4 KB | 56.3 K/s / 17.8 µs | 46.3 K/s / 21.6 µs |
+| AES-128-GCM | 64 B | 116 K/s / 8.66 µs | 153 K/s / 6.55 µs |
+| AES-128-GCM | 512 B | 125 K/s / 7.99 µs | 141 K/s / 7.12 µs |
+| AES-128-GCM | 4 KB | 58.6 K/s / 17.1 µs | 55.1 K/s / 18.2 µs |
+| AES-128-CTR | 64 B | 142 K/s / 7.02 µs | 194 K/s / 5.15 µs |
+| AES-128-CTR | 512 B | 181 K/s / 5.54 µs | 190 K/s / 5.25 µs |
+| AES-128-CTR | 4 KB | 85.5 K/s / 11.7 µs | 60.0 K/s / 16.7 µs |
+| XOR _(obfuscation only)_ | 64 B | 2.34 M/s / 428 ns | 1.88 M/s / 531 ns |
+| XOR _(obfuscation only)_ | 512 B | 549 K/s / 1.82 µs | 893 K/s / 1.12 µs |
+| XOR _(obfuscation only)_ | 4 KB | 102 K/s / 9.86 µs | 181 K/s / 5.51 µs |
 
 > AES and XOR string-path numbers shown (Redis L2). Buffer path (disk/snapshot) is 5–20% faster — no base64 overhead.  
 > AES-128-GCM is 5–50% faster than AES-256-GCM depending on payload (gap widens at mid-range sizes on AES-NI hardware).  
