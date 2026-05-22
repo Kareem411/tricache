@@ -18,7 +18,7 @@
  */
 
 export { CacheService }        from './cache-service';
-export { CacheEncryption }     from './encryption';
+export { CacheEncryption, type EncryptionMode } from './encryption';
 export { SmartMemoryCache }    from './smart-memory-cache';
 export { DiskTier }            from './disk-tier';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';

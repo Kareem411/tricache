@@ -45,7 +45,7 @@ describe('SmartMemoryCache', () => {
 
   it('reports isStale when past soft TTL but within hard TTL', async () => {
     const staleAt = Date.now() + 5;          // soft expiry in 5 ms
-    cache.set('stale', 'data', 60_000, { staleAt });
+    cache.set('stale', 'data', 60_000, CachePriority.NORMAL, staleAt);
     await new Promise(r => setTimeout(r, 20));
     const hit = cache.get('stale');
     expect(hit).not.toBeNull();
@@ -75,7 +75,7 @@ describe('SmartMemoryCache', () => {
     expect(hit!.value).toEqual(big);
   });
 
-  it('stores small entries as plain JSON (no compression)', () => {
+  it('stores small entries as msgpackr buffers', () => {
     cache.set('tiny', { ok: true }, 60_000);
     const hit = cache.get('tiny');
     expect(hit!.value).toEqual({ ok: true });
@@ -122,10 +122,10 @@ describe('SmartMemoryCache', () => {
       maxEntries: 3,
       categories: { default: { maxEntries: 3, maxSizeBytes: 1024 * 1024 } },
     });
-    tiny.set('auth:tok', 'secret', 60_000, { priority: CachePriority.CRITICAL });
-    tiny.set('a', 1, 60_000, { priority: CachePriority.LOW });
-    tiny.set('b', 2, 60_000, { priority: CachePriority.LOW });
-    tiny.set('c', 3, 60_000, { priority: CachePriority.LOW }); // triggers eviction
+    tiny.set('auth:tok', 'secret', 60_000, CachePriority.CRITICAL);
+    tiny.set('a', 1, 60_000, CachePriority.LOW);
+    tiny.set('b', 2, 60_000, CachePriority.LOW);
+    tiny.set('c', 3, 60_000, CachePriority.LOW); // triggers eviction
     // CRITICAL entry must survive
     expect(tiny.get('auth:tok')).not.toBeNull();
   });
@@ -143,7 +143,7 @@ describe('SmartMemoryCache', () => {
   });
 
   it('export skips CRITICAL entries', () => {
-    cache.set('auth:tok', 'x', 60_000, { priority: CachePriority.CRITICAL });
+    cache.set('auth:tok', 'x', 60_000, CachePriority.CRITICAL);
     const exported = cache.exportEntries(['auth:']);
     expect(exported.find(e => e.key === 'auth:tok')).toBeUndefined();
   });

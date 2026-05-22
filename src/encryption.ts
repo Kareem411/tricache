@@ -1,38 +1,157 @@
 /**
- * AES-256-GCM encryption for L2 (Redis) values and disk snapshots at rest.
+ * Encryption / obfuscation for L2 (Redis) values and disk snapshots at rest.
  *
- * Key:
- *   Pass a base64-encoded 32-byte secret via CacheOptions.encryptionKey
- *   or the CACHE_ENCRYPTION_KEY environment variable.
- *   Generate with:  node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+ * Four modes are supported via the `encryptionMode` CacheOption:
  *
- * Encrypted Redis value format:
- *   `enc:v1:` + base64( IV[12] | AuthTag[16] | Ciphertext[N] )
+ * ┌──────────────┬────────────┬──────────────────────────────────────────────────────────────┐
+ * │ Mode         │ Key bytes  │ Notes                                                        │
+ * ├──────────────┼────────────┼──────────────────────────────────────────────────────────────┤
+ * │ aes-256-gcm  │ 32         │ Default. Authenticated encryption (AEAD).                    │
+ * │ aes-128-gcm  │ 16         │ ~15% faster than AES-256. AEAD.                              │
+ * │ aes-128-ctr  │ 16         │ Fastest cipher. AES-NI keystream, no auth tag.               │
+ * │              │            │ Use when integrity is guaranteed elsewhere (TLS, HMAC, etc.). │
+ * │ xor          │ any (≥ 1)  │ XOR obfuscation ONLY — NOT cryptographic.                    │
+ * │              │            │ Use only for dev or non-sensitive data.                       │
+ * └──────────────┴────────────┴──────────────────────────────────────────────────────────────┘
  *
- * Encrypted disk/snapshot format:
- *   MAGIC[8] | IV[12] | AuthTag[16] | Ciphertext[N]
+ * Key generation:
+ *   AES-256 (32 B): node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+ *   AES-128 (16 B): node -e "console.log(require('crypto').randomBytes(16).toString('base64'))"
+ *   CTR    (16 B):  node -e "console.log(require('crypto').randomBytes(16).toString('base64'))"
+ *   XOR (any len):  node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+ *
+ * Redis envelope formats:
+ *   enc:v1:<base64(IV[12]|Tag[16]|CT)>   ← AES-256-GCM
+ *   a128:v1:<base64(IV[12]|Tag[16]|CT)>  ← AES-128-GCM
+ *   ctr:v1:<base64(IV[16]|CT)>           ← AES-128-CTR (no auth tag)
+ *   xor:v1:<base64(key⊕data)>            ← XOR (self-inverse)
+ *
+ * Disk envelope formats:
+ *   TRIC1ENC | IV[12] | Tag[16] | CT[N]  ← AES-256-GCM
+ *   TRIC1128 | IV[12] | Tag[16] | CT[N]  ← AES-128-GCM
+ *   TRIC1CTR | IV[16] | CT[N]            ← AES-128-CTR (no auth tag)
+ *   TRIC1XOR | key⊕data[N]               ← XOR
  */
 
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { createCipheriv, createDecipheriv, randomFillSync } from 'crypto';
 import type { ILogger } from './types';
 
-const AES_ALGO = 'aes-256-gcm' as const;
+// ── Public type ───────────────────────────────────────────────────────────────
+/** Encryption algorithm used for L2 (Redis) values and disk-tier files. */
+export type EncryptionMode = 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
+
+// ── GCM constants ─────────────────────────────────────────────────────────────
 const IV_BYTES  = 12; // 96-bit IV (NIST recommended for GCM)
 const TAG_BYTES = 16; // 128-bit auth tag
 
-// ── Redis value envelope ──────────────────────────────────────────────────────
-const ENC_REDIS_PREFIX = 'enc:v1:';
+// ── Redis prefixes ────────────────────────────────────────────────────────────
+const PREFIX_256 = 'enc:v1:';   // AES-256-GCM (legacy-compatible)
+const PREFIX_128 = 'a128:v1:';  // AES-128-GCM
+const PREFIX_XOR = 'xor:v1:';   // XOR obfuscation
 
-// ── Snapshot / disk envelope ─────────────────────────────────────────────────
-/** "TRIC1ENC" magic header — identifies an encrypted binary blob */
-const BINARY_MAGIC = Buffer.from([0x54, 0x52, 0x49, 0x43, 0x31, 0x45, 0x4e, 0x43]);
+// ── Binary magic headers (8 bytes each) ──────────────────────────────────────
+/** "TRIC1ENC" — AES-256-GCM disk blob */
+const MAGIC_256 = Buffer.from([0x54, 0x52, 0x49, 0x43, 0x31, 0x45, 0x4e, 0x43]);
+/** "TRIC1128" — AES-128-GCM disk blob */
+const MAGIC_128 = Buffer.from([0x54, 0x52, 0x49, 0x43, 0x31, 0x31, 0x32, 0x38]);
+/** "TRIC1XOR" — XOR-obfuscated disk blob */
+const MAGIC_XOR = Buffer.from([0x54, 0x52, 0x49, 0x43, 0x31, 0x58, 0x4f, 0x52]);
+/** "TRIC1CTR" — AES-128-CTR disk blob */
+const MAGIC_CTR = Buffer.from([0x54, 0x52, 0x49, 0x43, 0x31, 0x43, 0x54, 0x52]);
 
-// ─────────────────────────────────────────────────────────────────────────────
+const MAGIC_LEN = 8;
+
+// ── CTR constants ─────────────────────────────────────────────────────────────
+/** AES-128-CTR IV is the full 128-bit AES block used as the initial counter block. */
+const CTR_IV_BYTES = 16;
+const PREFIX_CTR   = 'ctr:v1:'; // AES-128-CTR (no auth tag)
+
+// ── IV pool ───────────────────────────────────────────────────────────────────
+// randomFillSync() fills the existing Buffer in-place — no allocation on refill.
+const IV_POOL_COUNT = 64;
 
 export class CacheEncryption {
   private _key: Buffer | null = null;
+  private readonly _mode: EncryptionMode;
 
-  constructor(keyBase64: string | undefined, logger: ILogger) {
+  // Pre-allocated GCM IV pool — 12-byte IVs (96-bit, NIST recommended).
+  private readonly _ivPool = Buffer.allocUnsafe(IV_BYTES * IV_POOL_COUNT);
+  private _ivOffset        = IV_BYTES * IV_POOL_COUNT; // start exhausted → fill on first use
+
+  /** Return the next unique 12-byte IV slice from the pre-allocated GCM pool. */
+  private _nextIV(): Buffer {
+    if (this._ivOffset >= this._ivPool.length) {
+      randomFillSync(this._ivPool); // fills existing Buffer in-place — zero allocation
+      this._ivOffset = 0;
+    }
+    const iv = this._ivPool.subarray(this._ivOffset, this._ivOffset + IV_BYTES); // Buffer (not Uint8Array)
+    this._ivOffset += IV_BYTES;
+    return iv;
+  }
+
+  // Pre-allocated CTR IV pool — 16-byte IVs (full AES block = initial counter block).
+  private readonly _ctrIvPool = Buffer.allocUnsafe(CTR_IV_BYTES * IV_POOL_COUNT);
+  private _ctrIvOffset        = CTR_IV_BYTES * IV_POOL_COUNT;
+
+  /** Return the next unique 16-byte IV slice from the pre-allocated CTR pool. */
+  private _nextCtrIV(): Buffer {
+    if (this._ctrIvOffset >= this._ctrIvPool.length) {
+      randomFillSync(this._ctrIvPool);
+      this._ctrIvOffset = 0;
+    }
+    const iv = this._ctrIvPool.subarray(this._ctrIvOffset, this._ctrIvOffset + CTR_IV_BYTES);
+    this._ctrIvOffset += CTR_IV_BYTES;
+    return iv;
+  }
+
+  /**
+   * XOR `data` with the key, cycling through key bytes.
+   * Self-inverse: _xorBuffer(_xorBuffer(x)) === x.
+   *
+   * Fast path: Uint32Array views over the existing Buffer memory — zero copy,
+   * no method-call overhead. V8 JITs `out32[i] = data32[i] ^ key32[...]`
+   * to a single `XOR r32, r32` instruction. Requires 4-byte-aligned byteOffsets,
+   * which Node.js guarantees (pool rounds up to 8 bytes; direct allocs to page).
+   *
+   * WARNING: XOR is NOT cryptographic. It provides obfuscation only.
+   */
+  private _xorBuffer(data: Buffer): Buffer {
+    const key  = this._key!;
+    const klen = key.length;
+    const len  = data.length;
+    const out  = Buffer.allocUnsafe(len);
+
+    if (
+      klen % 4 === 0 &&
+      len  >= 4 &&
+      data.byteOffset % 4 === 0 &&
+      out.byteOffset  % 4 === 0 &&
+      key.byteOffset  % 4 === 0
+    ) {
+      const wordCount = len >>> 2;
+      const data32    = new Uint32Array(data.buffer, data.byteOffset, wordCount);
+      const out32     = new Uint32Array(out.buffer,  out.byteOffset,  wordCount);
+      const key32     = new Uint32Array(key.buffer,  key.byteOffset,  klen >>> 2);
+      const kLen32    = key32.length;
+      for (let i = 0; i < wordCount; i++) {
+        out32[i] = data32[i] ^ key32[i % kLen32];
+      }
+      // 0–3 trailing bytes
+      for (let i = wordCount << 2; i < len; i++) {
+        out[i] = data[i] ^ key[i % klen];
+      }
+      return out;
+    }
+
+    // Fallback: buffer not 4-byte-aligned or key length not a multiple of 4
+    for (let i = 0; i < len; i++) {
+      out[i] = data[i] ^ key[i % klen];
+    }
+    return out;
+  }
+
+  constructor(keyBase64: string | undefined, logger: ILogger, mode: EncryptionMode = 'aes-256-gcm') {
+    this._mode = mode;
     if (!keyBase64) {
       if (process.env.NODE_ENV === 'production') {
         logger.warn(
@@ -44,11 +163,21 @@ export class CacheEncryption {
     }
     try {
       const buf = Buffer.from(keyBase64, 'base64');
-      if (buf.length !== 32) {
-        throw new Error(`Key must be exactly 32 bytes (got ${buf.length})`);
+      const requiredLen = mode === 'aes-256-gcm' ? 32 : (mode === 'aes-128-gcm' || mode === 'aes-128-ctr') ? 16 : 0;
+      if (requiredLen > 0 && buf.length !== requiredLen) {
+        throw new Error(`${mode} requires exactly ${requiredLen} bytes (got ${buf.length})`);
+      }
+      if (buf.length < 1) {
+        throw new Error('XOR key must be at least 1 byte');
       }
       this._key = buf;
-      logger.debug('Cache encryption enabled (AES-256-GCM)');
+      if (mode === 'xor') {
+        logger.warn(
+          'Cache obfuscation enabled (XOR). WARNING: XOR is NOT cryptographic — use only for dev or non-sensitive data.',
+        );
+      } else {
+        logger.debug(`Cache encryption enabled (${mode.toUpperCase()})`);
+      }
     } catch (err) {
       logger.error('Invalid encryption key — falling back to plaintext', {}, err as Error);
     }
@@ -60,59 +189,152 @@ export class CacheEncryption {
 
   /**
    * Encrypt a string for Redis storage.
-   * Returns `enc:v1:<base64>` when a key is configured; otherwise returns the
-   * original string unchanged (backward-compatible).
+   * Returns a mode-prefixed base64 string when a key is configured;
+   * otherwise returns the original string unchanged (backward-compatible).
    */
   encrypt(plaintext: string): string {
     if (!this._key) return plaintext;
-    const iv  = randomBytes(IV_BYTES);
-    const c   = createCipheriv(AES_ALGO, this._key, iv);
-    const enc = Buffer.concat([c.update(plaintext, 'utf8'), c.final()]);
-    const tag = c.getAuthTag();
-    return ENC_REDIS_PREFIX + Buffer.concat([iv, tag, enc]).toString('base64');
+    if (this._mode === 'xor') {
+      // WARNING: XOR is NOT cryptographic — obfuscation only.
+      const masked = this._xorBuffer(Buffer.from(plaintext, 'utf8'));
+      return PREFIX_XOR + masked.toString('base64');
+    }
+    if (this._mode === 'aes-128-ctr') {
+      const iv  = this._nextCtrIV();
+      const c   = createCipheriv('aes-128-ctr', this._key, iv);
+      const enc = c.update(plaintext, 'utf8'); // CTR: stream cipher — final() emits no bytes
+      c.final();
+      const out = Buffer.allocUnsafe(CTR_IV_BYTES + enc.length);
+      iv.copy(out, 0);
+      enc.copy(out, CTR_IV_BYTES);
+      return PREFIX_CTR + out.toString('base64');
+    }
+    const algo   = this._mode === 'aes-128-gcm' ? 'aes-128-gcm' : 'aes-256-gcm';
+    const prefix = this._mode === 'aes-128-gcm' ? PREFIX_128 : PREFIX_256;
+    const iv  = this._nextIV();
+    const c   = createCipheriv(algo, this._key, iv);
+    const enc = c.update(plaintext, 'utf8'); // GCM: final() emits no bytes
+    c.final();                               // finalise — makes auth tag available
+    const out = Buffer.allocUnsafe(IV_BYTES + TAG_BYTES + enc.length);
+    iv.copy(out, 0);
+    c.getAuthTag().copy(out, IV_BYTES);
+    enc.copy(out, IV_BYTES + TAG_BYTES);
+    return prefix + out.toString('base64');
   }
 
   /**
    * Decrypt a Redis value.
-   * Handles both the new `enc:v1:…` format and legacy plaintext seamlessly.
+   * Auto-detects the envelope prefix; returns plaintext unchanged if no prefix matches.
    */
   decrypt(value: string): string {
-    if (!value.startsWith(ENC_REDIS_PREFIX)) return value;
+    if (value.startsWith(PREFIX_XOR)) {
+      if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
+      // WARNING: XOR is NOT cryptographic — obfuscation only.
+      const masked = Buffer.from(value.slice(PREFIX_XOR.length), 'base64');
+      return this._xorBuffer(masked).toString('utf8');
+    }
+    if (value.startsWith(PREFIX_CTR)) {
+      if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
+      const combined = Buffer.from(value.slice(PREFIX_CTR.length), 'base64');
+      const iv = combined.subarray(0, CTR_IV_BYTES);
+      const ct = combined.subarray(CTR_IV_BYTES);
+      const d  = createDecipheriv('aes-128-ctr', this._key, iv);
+      const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
+      d.final();
+      return plain.toString('utf8');
+    }
+    const is256 = value.startsWith(PREFIX_256);
+    const is128 = value.startsWith(PREFIX_128);
+    if (!is256 && !is128) return value;
     if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
-    const combined = Buffer.from(value.slice(ENC_REDIS_PREFIX.length), 'base64');
+    const prefix = is128 ? PREFIX_128 : PREFIX_256;
+    const algo   = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
+    const combined = Buffer.from(value.slice(prefix.length), 'base64');
     const iv  = combined.subarray(0, IV_BYTES);
     const tag = combined.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const ct  = combined.subarray(IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(AES_ALGO, this._key, iv);
+    const d   = createDecipheriv(algo, this._key, iv);
     d.setAuthTag(tag);
-    return d.update(ct).toString('utf8') + d.final('utf8');
+    const plain = d.update(ct);  // GCM: final() emits no bytes
+    d.final();                   // verifies auth tag — throws on tamper
+    return plain.toString('utf8');
   }
 
   // ── Buffer (disk / snapshot) ──────────────────────────────────────────────
 
-  /** Encrypt a raw Buffer. Returns MAGIC | IV | AuthTag | Ciphertext when a key is set. */
+  /** Encrypt a raw Buffer for disk/snapshot. Returns MAGIC | payload when a key is set. */
   encryptBuffer(data: Buffer): Buffer {
     if (!this._key) return data;
-    const iv  = randomBytes(IV_BYTES);
-    const c   = createCipheriv(AES_ALGO, this._key, iv);
-    const enc = Buffer.concat([c.update(data), c.final()]);
-    const tag = c.getAuthTag();
-    return Buffer.concat([BINARY_MAGIC, iv, tag, enc]);
+    if (this._mode === 'xor') {
+      // WARNING: XOR is NOT cryptographic — obfuscation only.
+      const masked = this._xorBuffer(data);
+      const out = Buffer.allocUnsafe(MAGIC_LEN + masked.length);
+      MAGIC_XOR.copy(out, 0);
+      masked.copy(out, MAGIC_LEN);
+      return out;
+    }
+    if (this._mode === 'aes-128-ctr') {
+      const iv  = this._nextCtrIV();
+      const c   = createCipheriv('aes-128-ctr', this._key, iv);
+      const enc = c.update(data); // CTR: stream cipher — final() emits no bytes
+      c.final();
+      // Single pre-allocated output buffer: magic(8) | iv(16) | ciphertext(N)
+      const out = Buffer.allocUnsafe(MAGIC_LEN + CTR_IV_BYTES + enc.length);
+      MAGIC_CTR.copy(out, 0);
+      iv.copy(out, MAGIC_LEN);
+      enc.copy(out, MAGIC_LEN + CTR_IV_BYTES);
+      return out;
+    }
+    const magic = this._mode === 'aes-128-gcm' ? MAGIC_128 : MAGIC_256;
+    const algo  = this._mode === 'aes-128-gcm' ? 'aes-128-gcm' : 'aes-256-gcm';
+    const iv    = this._nextIV();
+    const c     = createCipheriv(algo, this._key, iv);
+    const enc   = c.update(data); // GCM: final() emits no bytes
+    c.final();                    // finalise — makes auth tag available
+    // Single pre-allocated output buffer: magic(8) | iv(12) | tag(16) | ciphertext(N)
+    const out   = Buffer.allocUnsafe(MAGIC_LEN + IV_BYTES + TAG_BYTES + enc.length);
+    magic.copy(out, 0);
+    iv.copy(out, MAGIC_LEN);
+    c.getAuthTag().copy(out, MAGIC_LEN + IV_BYTES);
+    enc.copy(out, MAGIC_LEN + IV_BYTES + TAG_BYTES);
+    return out;
   }
 
   /**
    * Decrypt a raw Buffer from disk/snapshot.
-   * Returns the original buffer if it does not carry the magic header (legacy/unencrypted).
+   * Auto-detects the magic header; returns the original buffer if no magic matches (legacy/unencrypted).
    */
   decryptBuffer(data: Buffer): Buffer {
-    const mLen = BINARY_MAGIC.length;
-    if (data.length < mLen || !data.subarray(0, mLen).equals(BINARY_MAGIC)) return data;
+    if (data.length < MAGIC_LEN) return data;
+    const magic = data.subarray(0, MAGIC_LEN);
+
+    if (magic.equals(MAGIC_XOR)) {
+      if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+      // WARNING: XOR is NOT cryptographic — obfuscation only.
+      return this._xorBuffer(data.subarray(MAGIC_LEN));
+    }
+
+    if (magic.equals(MAGIC_CTR)) {
+      if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+      const iv = data.subarray(MAGIC_LEN, MAGIC_LEN + CTR_IV_BYTES);
+      const ct = data.subarray(MAGIC_LEN + CTR_IV_BYTES);
+      const d  = createDecipheriv('aes-128-ctr', this._key, iv);
+      const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
+      d.final();
+      return plain;
+    }
+    const is256 = magic.equals(MAGIC_256);
+    const is128 = magic.equals(MAGIC_128);
+    if (!is256 && !is128) return data;
     if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
-    const iv  = data.subarray(mLen, mLen + IV_BYTES);
-    const tag = data.subarray(mLen + IV_BYTES, mLen + IV_BYTES + TAG_BYTES);
-    const ct  = data.subarray(mLen + IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(AES_ALGO, this._key, iv);
+    const algo = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
+    const iv  = data.subarray(MAGIC_LEN, MAGIC_LEN + IV_BYTES);
+    const tag = data.subarray(MAGIC_LEN + IV_BYTES, MAGIC_LEN + IV_BYTES + TAG_BYTES);
+    const ct  = data.subarray(MAGIC_LEN + IV_BYTES + TAG_BYTES);
+    const d   = createDecipheriv(algo, this._key, iv);
     d.setAuthTag(tag);
-    return Buffer.concat([d.update(ct), d.final()]);
+    const plain = d.update(ct);  // GCM: final() emits no bytes
+    d.final();                   // verifies auth tag — throws on tamper
+    return plain;
   }
 }

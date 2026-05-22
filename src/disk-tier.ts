@@ -181,7 +181,7 @@ export class DiskTier {
         key,
         entry: {
           ...entry,
-          data: entry.isCompressed && entry.data instanceof Uint8Array
+          data: entry.data instanceof Uint8Array
             ? Buffer.from(entry.data)
             : entry.data,
         },
@@ -240,7 +240,7 @@ export class DiskTier {
       if (payload.entry.expiresAt <= Date.now()) return null;
 
       const entry = payload.entry;
-      if (entry.isCompressed && entry.data instanceof Uint8Array) entry.data = Buffer.from(entry.data);
+      if (entry.data instanceof Uint8Array) entry.data = Buffer.from(entry.data);
 
       this.opts.logger.debug('DiskTier: hit (→L1)', { key: key.slice(0, 50), ageMs: Date.now() - payload.writtenAt });
       return entry;

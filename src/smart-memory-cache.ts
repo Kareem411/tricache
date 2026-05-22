@@ -16,10 +16,7 @@ import { pack, unpack } from 'msgpackr';
 import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger } from './types';
 import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Byte threshold above which entries are msgpackr-compressed */
-export const COMPRESSION_THRESHOLD_BYTES = 512;
 
 /** Fraction of candidates evicted in one pass when a limit is exceeded */
 const EVICTION_BATCH_PERCENT = 0.2;
@@ -30,6 +27,8 @@ class JsBloomFilter {
   private bits: Buffer;
   private readonly numBits: number;
   private readonly k: number;
+  /** Pre-computed — numBits and k are constant, no need to recalculate on every probe. */
+  private readonly _maxCapacity: number;
   /** Tracks total add() calls so we know when phantom bits have saturated the filter. */
   private _insertionCount = 0;
 
@@ -37,6 +36,8 @@ class JsBloomFilter {
     this.numBits = numBits;
     this.k = k;
     this.bits = Buffer.alloc(Math.ceil(numBits / 8), 0);
+    const p = 0.01;
+    this._maxCapacity = Math.floor(-numBits * Math.log(1 - Math.pow(p, 1 / k)) / k);
   }
 
   private fnv1a32(s: string): number {
@@ -77,10 +78,7 @@ class JsBloomFilter {
    * Exact formula for the configured k and target p=1 %:
    *   n_max = -m * ln(1 - p^(1/k)) / k
    */
-  get maxCapacity(): number {
-    const p = 0.01;
-    return Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / this.k)) / this.k);
-  }
+  get maxCapacity(): number { return this._maxCapacity; }
 
   get stats(): { bitsSet: number; fillFactor: number } {
     let bitsSet = 0;
@@ -113,23 +111,27 @@ export interface SmartMemoryCacheOptions {
 }
 
 export class SmartMemoryCache {
-  private readonly cache    = new Map<string, SmartCacheEntry>();
-  private readonly opts:    SmartMemoryCacheOptions;
-  private bloom:            AnyBloomFilter;
-  private totalSize         = 0;
-  private categoryCount     = new Map<string, number>();
-  private categorySize      = new Map<string, number>();
+  private readonly cache             = new Map<string, SmartCacheEntry>();
+  private readonly opts:             SmartMemoryCacheOptions;
+  private bloom:                     AnyBloomFilter;
+  /** Non-default category prefixes pre-extracted to avoid Object.keys() allocation on every call. */
+  private readonly categoryPrefixes: string[];
+  private totalSize                  = 0;
+  private categoryCount              = new Map<string, number>();
+  private categorySize               = new Map<string, number>();
 
   // ── Observability counters ──────────────────────────────────────────────────────
   private bloomChecks           = 0;
   private bloomFalsePos         = 0;
   private compressions          = 0;
-  private uncompressedEntries   = 0;
-  private compressionBytesSaved = 0;
+
+  /** Counts every _delete() call — used to trigger bloom rebuild from ALL deletion paths. */
+  private _bloomDirtyCount      = 0;
 
   constructor(opts: SmartMemoryCacheOptions, existing?: Map<string, SmartCacheEntry>) {
-    this.opts  = opts;
-    this.bloom = createBloomFilter(opts.logger);
+    this.opts             = opts;
+    this.bloom            = createBloomFilter(opts.logger);
+    this.categoryPrefixes = Object.keys(opts.categories).filter(k => k !== 'default');
 
     if (existing) {
       for (const [k, v] of existing) this.cache.set(k, v);
@@ -153,8 +155,8 @@ export class SmartMemoryCache {
   }
 
   private getCategory(key: string): string {
-    for (const prefix of Object.keys(this.opts.categories)) {
-      if (prefix !== 'default' && key.startsWith(prefix)) return prefix;
+    for (const prefix of this.categoryPrefixes) {
+      if (key.startsWith(prefix)) return prefix;
     }
     return 'default';
   }
@@ -170,6 +172,7 @@ export class SmartMemoryCache {
     this.totalSize -= entry.size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 1) - 1);
     this.categorySize.set(cat, (this.categorySize.get(cat) ?? entry.size) - entry.size);
+    this._bloomDirtyCount++;
     return this.cache.delete(key);
   }
 
@@ -192,13 +195,27 @@ export class SmartMemoryCache {
 
   /**
    * Rebuild the bloom filter when phantom bits from deleted/expired keys have
-   * pushed the insertion count past the filter's ~1 % FP capacity threshold.
-   * A rebuild anchors the bit-array to only live cache keys, instantly restoring
-   * accuracy.  Cost: O(cache.size) — only triggered when truly needed.
+   * saturated the filter past its ~1 % FP capacity.
+   *
+   * Trigger: (insertions − live entries) > maxCapacity
+   *
+   * Using the phantom count (insertions − cache.size) instead of raw insertions
+   * prevents an O(cache.size) rebuild from re-firing on every set() when the
+   * cache holds more entries than the filter's rated capacity — which would
+   * stall the write path entirely.
+   *
+   * After rebuild: insertions = cache.size → phantoms = 0 → no immediate re-trigger.
    */
   private maybeRebuildBloom(): void {
-    if (this.bloom.insertions > this.bloom.maxCapacity) {
+    // Two independent triggers — whichever fires first:
+    //   1. Phantom count (insertions of dead keys since last rebuild)
+    //   2. Deletion count (ANY _delete() call — expiry, eviction, or explicit)
+    // Trigger 2 uses maxCapacity>>>2 (~4500) so eviction/expiry cycling doesn't
+    // accumulate stale bits for thousands of ops before trigger 1 fires.
+    if (this._bloomDirtyCount > (this.bloom.maxCapacity >>> 2) ||
+        this.bloom.insertions - this.cache.size > this.bloom.maxCapacity) {
       this.bloom.rebuild(this.cache.keys());
+      this._bloomDirtyCount = 0;
     }
   }
 
@@ -237,10 +254,7 @@ export class SmartMemoryCache {
       this._delete(key);
       evicted++;
     }
-    this.opts.logger.debug('SmartMemoryCache: eviction', {
-      evicted, sampleSize: pool.length, reason: catOvf ? 'category' : 'global', targetCat,
-      remaining: this.cache.size, sizeKB: Math.round(this.totalSize / 1024),
-    });
+
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -250,11 +264,12 @@ export class SmartMemoryCache {
     if (!this.bloom.mightContain(key)) return null;
     const entry = this.cache.get(key);
     if (!entry) { this.bloomFalsePos++; return null; }
-    if (entry.expiresAt < Date.now()) { this._delete(key); return null; }
+    const now = Date.now();
+    if (entry.expiresAt < now) { this._delete(key); return null; }
     entry.hits++;
-    entry.lastAccess = Date.now();
-    const value = entry.isCompressed ? unpack(entry.data as Buffer) : JSON.parse(entry.data as string);
-    const isStale = entry.staleAt !== undefined && Date.now() > entry.staleAt;
+    entry.lastAccess = now;
+    const value = unpack(entry.data as Buffer);
+    const isStale = entry.staleAt !== undefined && now > entry.staleAt;
     return { value, isStale };
   }
 
@@ -262,29 +277,14 @@ export class SmartMemoryCache {
     key: string,
     data: unknown,
     ttlMs: number,
-    opts: { priority?: CachePriority; staleAt?: number } = {},
+    priority: CachePriority = 2 /* NORMAL */,
+    staleAt?: number,
   ): void {
-    const { priority = 2 /* NORMAL */, staleAt } = opts;
-    const jsonStr       = JSON.stringify(data);
-    const estimatedBytes = Buffer.byteLength(jsonStr, 'utf8');
-
-    let entryData: string | Buffer;
-    let size: number;
-    let isCompressed: boolean;
-
-    if (estimatedBytes >= COMPRESSION_THRESHOLD_BYTES) {
-      const packed = pack(data);
-      size          = Buffer.byteLength(packed);
-      entryData     = packed;
-      isCompressed  = true;
-      this.compressions++;
-      this.compressionBytesSaved += Math.max(0, estimatedBytes - size);
-    } else {
-      size         = estimatedBytes;
-      entryData    = jsonStr;
-      isCompressed = false;
-      this.uncompressedEntries++;
-    }
+    // Single serialization pass — always msgpackr. Eliminates the prior JSON.stringify
+    // "size probe" that was discarded for large payloads (the double-pass).
+    const packed = pack(data);
+    const size   = packed.byteLength;
+    this.compressions++;
 
     const cat = this.getCategory(key);
     const lim = this.getCategoryLimit(cat);
@@ -294,10 +294,18 @@ export class SmartMemoryCache {
       return;
     }
 
-    if (this.cache.has(key)) this._delete(key);
+    // Single Map.get replaces Map.has + _delete's Map.get (saves one lookup on overwrite).
+    const existingEntry = this.cache.get(key);
+    if (existingEntry) {
+      this.totalSize -= existingEntry.size;
+      this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 1) - 1);
+      this.categorySize.set(cat, (this.categorySize.get(cat) ?? existingEntry.size) - existingEntry.size);
+      this.cache.delete(key);
+    }
     this.ensureCapacity(cat, size);
 
-    this.cache.set(key, { data: entryData, isCompressed, expiresAt: Date.now() + ttlMs, staleAt, size, hits: 1, lastAccess: Date.now(), priority });
+    const now = Date.now();
+    this.cache.set(key, { data: packed, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority });
     this.bloom.add(key);
     this.maybeRebuildBloom();
     this.totalSize += size;
@@ -305,17 +313,24 @@ export class SmartMemoryCache {
     this.categorySize.set(cat,  (this.categorySize.get(cat)  ?? 0) + size);
   }
 
-  delete(key: string): boolean { return this._delete(key); }
+  delete(key: string): boolean {
+    const deleted = this._delete(key);
+    if (deleted) this.maybeRebuildBloom();
+    return deleted;
+  }
 
   private keysMatchingPattern(pattern: string): string[] {
     if (!pattern.includes('*')) return this.cache.has(pattern) ? [pattern] : [];
     const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return [...this.cache.keys()].filter(k => re.test(k));
+    const out: string[] = [];
+    for (const k of this.cache.keys()) if (re.test(k)) out.push(k);
+    return out;
   }
 
   deletePattern(pattern: string): number {
     let n = 0;
     for (const key of this.keysMatchingPattern(pattern)) if (this._delete(key)) n++;
+    if (n > 0) this.maybeRebuildBloom();
     return n;
   }
 
@@ -351,7 +366,7 @@ export class SmartMemoryCache {
     const now = Date.now();
     let cleaned = 0;
     for (const [key, entry] of this.cache) if (entry.expiresAt < now) { this._delete(key); cleaned++; }
-    if (cleaned > 0) this.bloom.rebuild(this.cache.keys());
+    if (cleaned > 0) { this.bloom.rebuild(this.cache.keys()); this._bloomDirtyCount = 0; }
     return cleaned;
   }
 
@@ -376,10 +391,14 @@ export class SmartMemoryCache {
       if (entry.expiresAt <= now) continue;
       if (forbiddenPrefixes.some(p => key.startsWith(p))) continue;
       if (this.cache.has(key)) continue;
-      const data: string | Buffer = entry.isCompressed && entry.data instanceof Uint8Array
-        ? Buffer.from(entry.data)
-        : entry.data as string | Buffer;
-      this.cache.set(key, { ...entry, data });
+      const rawData = entry.data;
+      // Handle both legacy (isCompressed=false, data=JSON string) and current (data=Buffer) formats.
+      const data: Buffer = !entry.isCompressed
+        ? pack(JSON.parse(rawData as unknown as string))  // legacy: re-encode JSON → msgpackr
+        : rawData instanceof Uint8Array
+          ? Buffer.from(rawData)                          // msgpackr Uint8Array → Buffer
+          : rawData as Buffer;                            // already a Buffer
+      this.cache.set(key, { ...entry, data, isCompressed: true });
       this.bloom.add(key);
       loaded++;
     }
@@ -405,8 +424,8 @@ export class SmartMemoryCache {
       },
       compression: {
         compressed:   this.compressions,
-        uncompressed: this.uncompressedEntries,
-        bytesSaved:   this.compressionBytesSaved,
+        uncompressed: 0,              // all entries are now msgpackr-packed
+        bytesSaved:   0,              // no longer tracked (unified format removes the split path)
       },
     };
   }

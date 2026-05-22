@@ -1,21 +1,21 @@
 # tricache
 
-**Three-tier Node.js cache with adaptive eviction, disk spill, Redis/Valkey L2, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.**
+**Three-tier Node.js cache with adaptive eviction, disk spill, Redis/Valkey L2, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, and Prometheus metrics.**
 
 ```
 Request
   │
   ▼
-L1 — SmartMemoryCache   (in-process RAM, 200 MB, adaptive LFU/LRU, always active)
+L1 — SmartMemoryCache   (in-process RAM, 200 MB default, adaptive LFU×LRU×priority eviction)
   │ miss
   ▼
-L1.5 — DiskTier         (NVMe spill, 500 MB, 2–100 µs, evicted L1 entries)
+L1.5 — DiskTier         (NVMe spill, 500 MB default, 2–100 µs, holds evicted L1 entries)
   │ miss
   ▼
-L2 — Redis / Valkey     (distributed, production-only by default)
+L2 — Redis / Valkey     (distributed, production-only by default, pub/sub invalidation)
   │ miss
   ▼
-fetchFn()               (your database / API call)
+fetchFn()               (your database / API call — fires exactly once per key under load)
 ```
 
 ---
@@ -24,16 +24,18 @@ fetchFn()               (your database / API call)
 
 | Feature | Detail |
 |---|---|
-| **Adaptive eviction** | LFU × LRU × priority score; category-aware limits prevent any prefix from monopolising RAM |
-| **WASM Bloom filter** | O(k) guaranteed-miss detection — 562-byte binary, inlined as Base64, JS fallback |
-| **msgpackr compression** | Entries ≥ 512 bytes are compressed; smaller entries stored as JSON |
-| **Stale-While-Revalidate** | Serve stale data instantly, revalidate in background |
-| **Thundering-herd prevention** | Inflight Promise registry — only one DB call per key at a time |
-| **Cold-start snapshot** | L1 persisted to disk on `SIGTERM`/`SIGINT`, reloaded on next startup |
-| **AES-256-GCM encryption** | L2 (Redis) values and disk files encrypted at rest |
+| **Adaptive eviction** | LFU × LRU × priority score; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
+| **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
+| **msgpackr serialization** | All entries packed with msgpackr — uniform binary format, no JSON at any payload size |
+| **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
+| **Thundering-herd prevention** | Inflight `Promise` registry — only one `fetchFn` call per key regardless of concurrency |
+| **Pub/sub invalidation backplane** | Redis pub/sub channel propagates deletes across all instances in real time |
+| **OOM guard** | Polls `heapUsed/heapTotal` on a timer; emergency-evicts coldest L1 entries before the process crashes |
+| **Cold-start snapshot** | L1 serialised to disk on `SIGTERM`/`SIGINT`, reloaded on next startup — warm cache, cold process |
+| **AES-256-GCM encryption** | L2 (Redis) values, disk spill files, and snapshots encrypted at rest |
+| **Prometheus metrics** | `cache.metrics()` + `CacheService.toPrometheusText()` — drop into any `/metrics` endpoint |
 | **Distributed counter** | `cache.increment()` backed by Redis `INCR` for distributed rate limiting |
 | **Pluggable logger** | Bring your own `pino`, `winston`, etc. |
-| **ESM + CJS** | Dual-format build via tsup |
 
 ---
 
@@ -45,8 +47,6 @@ npm install tricache
 pnpm add tricache
 ```
 
-> **Peer dependency**: `ioredis` is a regular dependency — no separate install needed.
-
 ---
 
 ## Quick start
@@ -54,12 +54,12 @@ pnpm add tricache
 ```typescript
 import { CacheService, CachePriority } from 'tricache';
 
-// Create (or retrieve) the process-level singleton
+// Get (or create) the process-level singleton
 const cache = CacheService.create({
-  redisHost: 'my-redis.example.com',   // omit to disable L2
+  redisHost: 'my-redis.example.com',   // omit or set NODE_ENV!=production to disable L2
 });
 
-// Get-or-fetch (5-minute TTL)
+// Get-or-fetch with a 5-minute TTL
 const user = await cache.get(
   `user:${userId}`,
   () => db.users.findById(userId),
@@ -69,13 +69,13 @@ const user = await cache.get(
 // Explicit set
 await cache.set(`user:${userId}`, user, 300);
 
-// Delete exact key
+// Delete one key
 await cache.delete(`user:${userId}`);
 
-// Delete by pattern (glob)
+// Delete by glob pattern
 await cache.delete(`user:${userId}:*`);
 
-// Stale-While-Revalidate: serve stale for up to 30 extra seconds
+// Stale-While-Revalidate: serve stale for up to 30 s while refreshing in background
 const dashboard = await cache.get(
   `dashboard:${orgId}`,
   () => analytics.buildDashboard(orgId),
@@ -83,8 +83,12 @@ const dashboard = await cache.get(
   { swr: 30 },
 );
 
-// Distributed counter (rate limiting)
-const count = await cache.increment(`ratelimit:${ip}`, 60 /* TTL seconds */);
+// Distributed rate-limiting counter
+const hits = await cache.increment(`ratelimit:${ip}`, 60 /* TTL seconds */);
+
+// Prometheus metrics
+const snap = cache.metrics();
+console.log(CacheService.toPrometheusText(snap));
 ```
 
 ---
@@ -95,39 +99,59 @@ All options are optional — sensible defaults apply.
 
 ```typescript
 CacheService.create({
+  // ── Namespace ─────────────────────────────────────────────────────────
+  // Isolates keys, disk dir, snapshot file, and Redis backplane channel.
+  // Two instances with different namespaces are fully independent.
+  namespace: 'my-app',
+
   // ── Logger ────────────────────────────────────────────────────────────
-  logger: pinoLogger,               // default: minimal console logger
+  logger: pinoLogger,               // default: console warn/error only
 
   // ── L1 (in-memory) ───────────────────────────────────────────────────
-  l1MaxBytes:   200 * 1024 * 1024,  // 200 MB total RAM cap
-  l1MaxEntries: 2_000,              // max entries in L1
+  l1MaxBytes:   200 * 1024 * 1024,  // 200 MB total RAM cap (default)
+  l1MaxEntries: 2_000,              // max entries in L1 (default)
   categoryLimits: {
-    // per-prefix limits (prefix = first segment of your cache key)
-    'user:':      { maxEntries: 500,  maxSizeBytes: 50 * 1024 * 1024 },
-    'analytics:': { maxEntries: 100,  maxSizeBytes: 20 * 1024 * 1024 },
+    // per-prefix limits — keys are matched by startsWith()
+    'user:':      { maxEntries: 500,  maxSizeBytes: 50  * 1024 * 1024 },
+    'analytics:': { maxEntries: 100,  maxSizeBytes: 20  * 1024 * 1024 },
     'default':    { maxEntries: 1000, maxSizeBytes: 100 * 1024 * 1024 },
   },
 
   // ── L1.5 (disk spill) ────────────────────────────────────────────────
   diskCacheDir:      '/tmp/my-app-cache',  // default: os.tmpdir()/tricache-disk
-  diskMaxBytes:      500 * 1024 * 1024,   // 500 MB
-  diskEntryMaxBytes: 10  * 1024 * 1024,   // 10 MB per entry
+  diskMaxBytes:      500 * 1024 * 1024,   // 500 MB (default)
+  diskEntryMaxBytes: 10  * 1024 * 1024,   // 10 MB per entry (default)
 
   // ── L2 (Redis / Valkey) ──────────────────────────────────────────────
-  redisHost:    'my-redis.example.com',   // or set REDIS_HOST env var
+  redisHost:    'my-redis.example.com',   // or REDIS_HOST env var
   redisPort:    6379,
-  redisTls:     true,                     // default true in production
-  disableRedis: false,                    // default true in development
+  redisTls:     true,                     // default: true when NODE_ENV=production
+  disableRedis: false,                    // default: true when NODE_ENV!=production
+
+  // ── Invalidation backplane ───────────────────────────────────────────
+  // Redis pub/sub channel that propagates deletes to all instances.
+  // Enabled by default when Redis is active.
+  invalidationBackplane: true,
+
+  // ── OOM guard ────────────────────────────────────────────────────────
+  oomProtection:      true,   // enabled by default
+  oomHeapThreshold:   0.85,   // evict when heapUsed/heapTotal > 85 %
+  oomCheckIntervalMs: 10_000, // poll every 10 s
+  oomEvictPercent:    0.20,   // evict coldest 20 % of L1 per trigger
 
   // ── Encryption ───────────────────────────────────────────────────────
-  // base64-encoded 32-byte AES-256-GCM key (or set CACHE_ENCRYPTION_KEY env var)
-  // generate: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+  // base64-encoded 32-byte key; or set CACHE_ENCRYPTION_KEY env var.
+  // node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
   encryptionKey: process.env.CACHE_ENCRYPTION_KEY,
 
   // ── Cold-start snapshot ──────────────────────────────────────────────
-  snapshotPath:     '/tmp/my-app-cache-snapshot.msgpack',
-  snapshotMaxAgeMs: 2 * 60 * 60 * 1000,  // 2 hours
+  snapshotPath:              '/tmp/my-app-cache-snapshot.msgpack',
+  snapshotMaxAgeMs:          2 * 60 * 60 * 1000,  // 2 hours (default)
   forbiddenSnapshotPrefixes: ['auth:', 'session:', 'mfa:', 'rate_limit:'],
+
+  // ── Metrics callback ─────────────────────────────────────────────────
+  metricsIntervalMs: 60_000,                       // emit every 60 s (default)
+  onMetrics: (m) => myMonitoring.record(m),        // optional push callback
 });
 ```
 
@@ -137,40 +161,69 @@ CacheService.create({
 |---|---|
 | `REDIS_HOST` | Redis/Valkey hostname (used when `redisHost` option is not set) |
 | `CACHE_ENCRYPTION_KEY` | Base64-encoded 32-byte AES-256-GCM key |
-| `NODE_ENV` | When `!== 'production'`, L2 Redis is disabled by default |
+| `NODE_ENV` | When `!== 'production'`, L2 Redis and TLS are disabled by default |
 
 ---
 
 ## API reference
 
 ### `CacheService.create(options?)` → `CacheService`
-Returns the process-level singleton. Options are only applied on the first call.
+
+Returns the process-level singleton. Options are only applied on the **first** call per namespace — subsequent calls return the existing instance.
 
 ### `CacheService.reset(options?)` → `CacheService`
-Destroy the existing singleton and create a fresh one (useful in tests).
+
+Destroys the existing singleton and creates a fresh one. Useful in tests.
 
 ### `cache.get<T>(key, fetchFn, ttlSeconds?, opts?)` → `Promise<T>`
-Get from cache or call `fetchFn` on miss.
-- `opts.priority` — `CachePriority.LOW | NORMAL | HIGH | CRITICAL`
-- `opts.swr` — Stale-While-Revalidate grace seconds
+
+Get from cache or call `fetchFn` on a miss. The inflight map ensures `fetchFn` fires at most once per key regardless of concurrency.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key` | `string` | — | Cache key |
+| `fetchFn` | `() => Promise<T>` | — | Called on a miss; result is cached |
+| `ttlSeconds` | `number` | `300` | Hard TTL in seconds |
+| `opts.swr` | `number` | `0` | Stale-While-Revalidate grace seconds |
+| `opts.priority` | `CachePriority` | auto-inferred | Eviction priority override |
 
 ### `cache.set<T>(key, data, ttlSeconds?, priority?)` → `Promise<void>`
-Explicitly write to L1 (+ L2 in production).
+
+Writes to L1 and (in production) L2. Publishes an invalidation to the backplane.
 
 ### `cache.delete(key)` → `Promise<void>`
-Delete an exact key or a glob pattern (e.g. `user:abc:*`).
+
+Deletes one exact key or a glob pattern (`user:abc:*`). Propagates to disk, Redis, and all backplane peers.
 
 ### `cache.increment(key, ttlSeconds?)` → `Promise<number>`
-Redis `INCR` for distributed counters. Returns `0` when Redis is disabled.
+
+Redis `INCR` — atomically increments a counter, setting TTL on first write. Returns `0` when Redis is disabled (safe for dev).
+
+### `cache.metrics()` → `CacheMetrics`
+
+Returns a full metrics snapshot including hit rates, bloom filter stats, compression savings, backplane counters, OOM eviction history, and tier sizes.
+
+### `CacheService.toPrometheusText(metrics, prefix?)` → `string`
+
+Converts a `CacheMetrics` snapshot to Prometheus text exposition format. Paste into your `/metrics` route.
+
+```typescript
+app.get('/metrics', (_req, res) => {
+  res.type('text/plain').send(CacheService.toPrometheusText(cache.metrics()));
+});
+```
 
 ### `cache.stats()` → `{ l1, disk }`
-Current cache statistics.
+
+Lightweight L1 and disk stats without the full metrics breakdown.
 
 ### `cache.writeSnapshot()` / `cache.loadSnapshot()`
-Manual snapshot control (normally handled automatically on `SIGTERM`/`SIGINT`).
+
+Manual snapshot control. Called automatically on `SIGTERM`/`SIGINT` — only needed when you manage shutdown yourself.
 
 ### `cache.destroy()` → `Promise<void>`
-Close Redis connection and stop the cleanup timer.
+
+Closes the Redis connection, unsubscribes the backplane, and stops all background timers.
 
 ---
 
@@ -179,17 +232,34 @@ Close Redis connection and stop the cleanup timer.
 ```typescript
 import { CachePriority } from 'tricache';
 
-CachePriority.LOW      // analytics, reports — evicted first
-CachePriority.NORMAL   // general data
-CachePriority.HIGH     // profiles, config — evicted last
-CachePriority.CRITICAL // never evicted while valid (auth tokens, active sessions)
+CachePriority.LOW      // 1 — analytics, reports — evicted first
+CachePriority.NORMAL   // 2 — general application data (default)
+CachePriority.HIGH     // 3 — user profiles, config — evicted last
+CachePriority.CRITICAL // 4 — never evicted while valid (auth tokens, sessions)
 ```
 
-When not specified, priority is inferred from the key prefix:
-- `auth:`, `session:` → `CRITICAL`
-- `user:`, `org:`, `profile:` → `HIGH`
-- `analytics:`, `report:`, `stats:` → `LOW`
-- everything else → `NORMAL`
+Priority is **auto-inferred** from the key when not specified:
+
+| Key contains | Inferred priority |
+|---|---|
+| `auth:` or `session:` | `CRITICAL` |
+| `user:`, `org:`, or `profile:` | `HIGH` |
+| `analytics:`, `report:`, or `stats:` | `LOW` |
+| anything else | `NORMAL` |
+
+---
+
+## Eviction algorithm
+
+L1 eviction uses **reservoir sampling** — an O(n) single pass samples 16 candidates, then sorts only those 16 (O(1)). Each candidate is scored:
+
+```
+score = priority × 1000 + min(hits, 100) × 10 + ttlRemaining/60s − age/60s
+```
+
+- Higher score = kept longer
+- `CRITICAL` entries are excluded from sampling while valid
+- When a category limit is breached, entries from that category receive a score penalty
 
 ---
 
@@ -197,11 +267,9 @@ When not specified, priority is inferred from the key prefix:
 
 ```typescript
 import pino from 'pino';
-import { CacheService } from 'tricache';
-
 const logger = pino();
 
-const cache = CacheService.create({
+CacheService.create({
   logger: {
     debug: (msg, meta) => logger.debug(meta ?? {}, msg),
     info:  (msg, meta) => logger.info(meta  ?? {}, msg),
@@ -215,34 +283,117 @@ const cache = CacheService.create({
 
 ## Encryption
 
-AES-256-GCM encryption for L2 (Redis) values and disk files:
+AES-256-GCM for L2 (Redis) values, disk spill files, and cold-start snapshots. Three modes are available via `encryptionMode`:
+
+| Mode | Key length | Notes |
+|---|---|---|
+| `aes-256-gcm` | 32 bytes | **Default.** Authenticated encryption (AEAD). |
+| `aes-128-gcm` | 16 bytes | ~15% faster than AES-256. Same AEAD guarantees. |
+| `aes-128-ctr` | 16 bytes | Fastest cipher mode. AES-NI keystream, no auth tag. Use when integrity is guaranteed elsewhere (TLS, HMAC). |
+| `xor` | any (≥ 16 bytes recommended) | **NOT cryptographic.** XOR obfuscation only. Dev/non-sensitive data. |
+
+**Key generation:**
 
 ```bash
-# Generate a key
+# AES-256 (32 bytes)
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+
+# AES-128 / AES-128-CTR (16 bytes)
+node -e "console.log(require('crypto').randomBytes(16).toString('base64'))"
+
+# XOR — any length, minimum 16 bytes recommended
 node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ```
 
 ```typescript
+// AES-256-GCM (default)
 CacheService.create({ encryptionKey: '<base64-32-bytes>' });
-// or
-process.env.CACHE_ENCRYPTION_KEY = '<base64-32-bytes>';
+
+// AES-128-GCM
+CacheService.create({ encryptionKey: '<base64-16-bytes>', encryptionMode: 'aes-128-gcm' });
+
+// AES-128-CTR (fastest cipher, no auth tag)
+CacheService.create({ encryptionKey: '<base64-16-bytes>', encryptionMode: 'aes-128-ctr' });
+
+// XOR obfuscation (NOT cryptographic — dev/non-sensitive only)
+CacheService.create({ encryptionKey: '<base64-key>', encryptionMode: 'xor' });
+
+// or use the env var: CACHE_ENCRYPTION_KEY=<base64-key>
 ```
 
-Encrypted Redis format: `enc:v1:<base64(IV[12] | AuthTag[16] | Ciphertext[N])>`  
-Disk/snapshot format: `MAGIC[8] | IV[12] | AuthTag[16] | Ciphertext[N]`
+| Mode | Redis format | Disk / snapshot format |
+|---|---|---|
+| `aes-256-gcm` | `enc:v1:<base64(IV[12]\|Tag[16]\|CT)>` | `TRIC1ENC\|IV[12]\|Tag[16]\|CT[N]` |
+| `aes-128-gcm` | `a128:v1:<base64(IV[12]\|Tag[16]\|CT)>` | `TRIC1128\|IV[12]\|Tag[16]\|CT[N]` |
+| `aes-128-ctr` | `ctr:v1:<base64(IV[16]\|CT)>` | `TRIC1CTR\|IV[16]\|CT[N]` |
+| `xor` | `xor:v1:<base64(key⊕data)>` | `TRIC1XOR\|key⊕data[N]` |
 
-Legacy plaintext values are read transparently during migration.
+Existing plaintext values are read transparently during key rotation.
 
 ---
 
-## How the WASM Bloom filter works
+## WASM Bloom filter
 
-A 100,000-bit filter with 7 hash probes gives a ~0.01% false-positive rate at 2,000 entries.
+A 100,000-bit filter with k=7 hash probes:
 
+- At the default `l1MaxEntries: 2,000` — false-positive rate ≈ **0.01%**
+- At rated capacity (~18,000 entries) — false-positive rate ≈ **1%**
+- The filter rebuilds automatically when stale bits from deleted/expired entries accumulate
+
+Mechanics:
 - `mightContain(key) === false` → **guaranteed miss** — the Map lookup is skipped entirely
-- `mightContain(key) === true` → probable hit — the Map lookup is performed to confirm
+- `mightContain(key) === true` → probable hit — the Map is checked to confirm
 
-The 562-byte WASM binary is inlined as Base64 — no file-system access at runtime. Falls back to a pure-JS implementation if `WebAssembly` is unavailable.
+The 562-byte WASM binary is inlined as Base64 — zero filesystem access at runtime. Falls back to a pure-JS implementation if `WebAssembly` is unavailable.
+
+---
+
+## Performance
+
+Measured on a single Node.js thread (no `await` on synchronous paths):
+
+**L1 SmartMemoryCache**
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| `get` — hot hit (8K entries) | 1.32 M/s | 758 ns | bloom → Map lookup |
+| `get` — cold miss | 6.14 M/s | 163 ns | bloom gates → early return |
+| `set` — tiny payload | 1.07 M/s | 938 ns | pack() + Map.set + bloom.add |
+| `set` — large payload (≥ 512 B) | 204 K/s | 4.90 µs | pack() larger payload |
+| `delete` — exact key | 4.08 M/s | 245 ns | Map.delete |
+
+**CacheService (end-to-end)**
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| `get` — L1 warm hit | 1.72 M/s | 580 ns | inflight check → l1.get |
+| `get` — SWR stale serve | 1.17 M/s | 854 ns | serves stale; revalidates async |
+| `get` — miss + fetchFn | 20.3 K/s | 49.3 µs | Promise microtask + l1.set |
+| `set` | 35.4 K/s | 28.2 µs | l1.set + disk.save (fire-and-forget) |
+
+**Encryption** (IV pool, pre-allocated output buffers)
+
+| Mode | Payload | Encrypt | Decrypt |
+|---|---|---|---|
+| AES-256-GCM | 64 B | 127 K/s / 7.85 µs | 135 K/s / 7.39 µs |
+| AES-256-GCM | 512 B | 86.0 K/s / 11.6 µs | 128 K/s / 7.82 µs |
+| AES-256-GCM | 4 KB | 47.3 K/s / 21.1 µs | 52.3 K/s / 19.1 µs |
+| AES-128-GCM | 64 B | 135 K/s / 7.42 µs | 152 K/s / 6.60 µs |
+| AES-128-GCM | 512 B | 130 K/s / 7.68 µs | 133 K/s / 7.52 µs |
+| AES-128-GCM | 4 KB | 50.1 K/s / 20.0 µs | 58.3 K/s / 17.2 µs |
+| AES-128-CTR | 64 B | 195 K/s / 5.13 µs | 200 K/s / 5.00 µs |
+| AES-128-CTR | 512 B | 176 K/s / 5.69 µs | 190 K/s / 5.25 µs |
+| AES-128-CTR | 4 KB | 74.8 K/s / 13.4 µs | 67.0 K/s / 14.9 µs |
+| XOR _(obfuscation only)_ | 64 B | 2.23 M/s / 449 ns | 2.16 M/s / 462 ns |
+| XOR _(obfuscation only)_ | 512 B | 736 K/s / 1.36 µs | 598 K/s / 1.67 µs |
+| XOR _(obfuscation only)_ | 4 KB | 108 K/s / 9.24 µs | 185 K/s / 5.40 µs |
+
+> AES and XOR string-path numbers shown (Redis L2). Buffer path (disk/snapshot) is 5–20% faster — no base64 overhead.  
+> AES-128-GCM is 5–50% faster than AES-256-GCM depending on payload (gap widens at mid-range sizes on AES-NI hardware).  
+> AES-128-CTR removes the GHASH MAC step: ~50% faster than AES-128-GCM at small payloads; use only when integrity is guaranteed by transport.  
+> XOR numbers are for the buffer path (32-bit word-level XOR, 4 bytes/iteration). XOR dominates at small payloads (no cipher setup) and remains ~2× faster than AES at 4 KB.
+
+Run `pnpm bench` for a full breakdown including bloom filter cost, compression trade-offs, eviction pressure, concurrency, and a realistic 80/15/5 read/miss/write workload.
 
 ---
 

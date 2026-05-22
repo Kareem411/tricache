@@ -6,17 +6,18 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync } from 'fs';
 import { consoleLogger } from '../src/types';
+import { pack, unpack } from 'msgpackr';
 
 function tempDir() {
   return join(tmpdir(), `tricache-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 }
 
 function makeEntry(value: string, ttlMs = 60_000): SmartCacheEntry {
-  const data    = JSON.stringify(value);
-  const size    = Buffer.byteLength(data, 'utf8');
+  const data = pack(value);
+  const size = data.byteLength;
   return {
     data,
-    isCompressed:  false,
+    isCompressed:  true,
     expiresAt:     Date.now() + ttlMs,
     size,
     hits:          1,
@@ -45,7 +46,7 @@ describe('DiskTier', () => {
     await disk.save('key1', entry);
     const loaded = disk.load('key1');
     expect(loaded).not.toBeNull();
-    expect(JSON.parse(loaded!.data as string)).toBe('hello world');
+    expect(unpack(loaded!.data as Buffer)).toBe('hello world');
   });
 
   it('returns null for an expired entry', async () => {
@@ -82,14 +83,14 @@ describe('DiskTier', () => {
     await disk.save('shared-key', makeEntry('shared-value'));
     // load() consumes the file (promotes to L1), so use a second instance to read it before consuming
     const disk2 = new DiskTier({ dir, maxBytes: 10 * 1024 * 1024, entryMaxBytes: 1024 * 1024, forbiddenPrefixes: [], logger: consoleLogger });
-    expect(JSON.parse(disk2.load('shared-key')!.data as string)).toBe('shared-value');
+    expect(unpack(disk2.load('shared-key')!.data as Buffer)).toBe('shared-value');
   });
 
   it('encrypts and decrypts when encryptionKey is supplied', async () => {
     const keyBuf = Buffer.from('00'.repeat(32), 'hex'); // 32 zero bytes
     const enc = new DiskTier({ dir: tempDir(), maxBytes: 10 * 1024 * 1024, entryMaxBytes: 1024 * 1024, forbiddenPrefixes: [], encryptionKey: keyBuf, logger: consoleLogger });
     await enc.save('secret', makeEntry('sensitive-data'));
-    expect(JSON.parse(enc.load('secret')!.data as string)).toBe('sensitive-data');
+    expect(unpack(enc.load('secret')!.data as Buffer)).toBe('sensitive-data');
   });
 
   it('stats reflects stored files', async () => {

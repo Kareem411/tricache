@@ -49,6 +49,8 @@ export class WasmBloomFilter {
   private readonly mem: Uint8Array;
   private readonly encoder = new TextEncoder();
   private readonly numBits = 100_000;
+  /** Pre-computed — k and numBits are fixed constants; no need to recalculate on every probe. */
+  private readonly _maxCapacity: number;
   /** Tracks total add() calls so we know when phantom bits have saturated the filter. */
   private _insertionCount = 0;
 
@@ -56,15 +58,26 @@ export class WasmBloomFilter {
     const instance = instantiateSync();
     this.exports = instance.exports as unknown as BloomWasmExports;
     this.mem = new Uint8Array(this.exports.memory.buffer);
+    const k = 7, p = 0.01;
+    this._maxCapacity = Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / k)) / k);
   }
 
   private writeKey(key: string): number {
-    if (!key) return 0;
-    const encoded = this.encoder.encode(key);
-    const len = Math.min(encoded.length, MAX_KEY_BYTES);
-    if (len === 0) return 0;
-    this.mem.set(encoded.subarray(0, len), KEY_STAGING_OFFSET);
-    return len;
+    const max = Math.min(key.length, MAX_KEY_BYTES);
+    if (max === 0) return 0;
+    // Fast path: write ASCII bytes directly, skipping TextEncoder heap allocation.
+    // On the first non-ASCII char, fall back to TextEncoder for correct multi-byte encoding.
+    for (let i = 0; i < max; i++) {
+      const c = key.charCodeAt(i);
+      if (c > 127) {
+        const encoded = this.encoder.encode(key);
+        const len = Math.min(encoded.length, MAX_KEY_BYTES);
+        this.mem.set(encoded.subarray(0, len), KEY_STAGING_OFFSET);
+        return len;
+      }
+      this.mem[KEY_STAGING_OFFSET + i] = c;
+    }
+    return max;
   }
 
   add(key: string): void {
@@ -88,7 +101,8 @@ export class WasmBloomFilter {
   }
 
   get stats(): { bitsSet: number; fillFactor: number } {
-    return { bitsSet: this.exports.countBits(), fillFactor: this.exports.countBits() / this.numBits };
+    const bitsSet = this.exports.countBits();
+    return { bitsSet, fillFactor: bitsSet / this.numBits };
   }
 
   /** Number of add() calls since last reset/rebuild. */
@@ -99,8 +113,5 @@ export class WasmBloomFilter {
    * Exact formula for k=7 hash rounds, m=100 000 bits:
    *   n_max = -m * ln(1 - p^(1/k)) / k  ≈ 18 169
    */
-  get maxCapacity(): number {
-    const k = 7, p = 0.01;
-    return Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / k)) / k);
-  }
+  get maxCapacity(): number { return this._maxCapacity; }
 }

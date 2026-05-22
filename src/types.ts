@@ -34,9 +34,10 @@ export enum CachePriority {
 
 /** Internal representation of a single cache entry in the L1 Map */
 export interface SmartCacheEntry {
-  /** msgpack Buffer (compressed) or plain JSON string */
-  data: string | Buffer;
-  /** true = Buffer (msgpackr-compressed), false = JSON string */
+  /** msgpackr-packed binary payload */
+  data: Buffer;
+  /** always true for entries written by the current code;
+   *  may be false in legacy snapshots/disk files — handled transparently on import */
   isCompressed: boolean;
   /** Hard expiry — entry is deleted after this timestamp */
   expiresAt: number;
@@ -61,7 +62,8 @@ export interface CacheHit {
 
 // ─── Disk tier ───────────────────────────────────────────────────────────────
 
-/** On-disk entry shape (mirrors SmartCacheEntry — Uint8Array accepted for msgpack round-trips) */
+/** On-disk entry shape (mirrors SmartCacheEntry — Uint8Array accepted for msgpack round-trips;
+ *  legacy disk files written by older versions may have a JSON string in data) */
 export interface DiskCacheEntry {
   data: string | Buffer | Uint8Array;
   isCompressed: boolean;
@@ -224,6 +226,16 @@ export interface CacheOptions {
    * If not provided in production, a warning is logged and data is stored plaintext.
    */
   encryptionKey?: string;
+  /**
+   * Encryption algorithm used for L2 (Redis) values and disk-tier files.
+   * - `'aes-256-gcm'` — default. 32-byte key. Authenticated encryption (AEAD).
+   * - `'aes-128-gcm'` — 16-byte key. ~10% faster on non-AES-NI hardware. AEAD.
+   * - `'xor'`         — XOR obfuscation ONLY. NOT cryptographic security.
+   *                     Any key length (minimum 16 bytes recommended).
+   *                     Use for dev environments or non-sensitive data only.
+   * Default: `'aes-256-gcm'`
+   */
+  encryptionMode?: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
 
   // ── Snapshot ────────────────────────────────────────────────────────────
   /**

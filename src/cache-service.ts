@@ -58,9 +58,9 @@ const DEFAULT_FORBIDDEN_PREFIXES = ['auth:', 'session:', 'mfa:', 'rate_limit:'] 
 // ─────────────────────────────────────────────────────────────────────────────
 
 function inferPriority(cacheKey: string): CachePriority {
-  if (/auth:|session:/.test(cacheKey))          return CachePriority.CRITICAL;
-  if (/user:|org:|profile:/.test(cacheKey))      return CachePriority.HIGH;
-  if (/analytics:|report:|stats:/.test(cacheKey)) return CachePriority.LOW;
+  if (cacheKey.includes('auth:') || cacheKey.includes('session:'))                                   return CachePriority.CRITICAL;
+  if (cacheKey.includes('user:') || cacheKey.includes('org:') || cacheKey.includes('profile:'))      return CachePriority.HIGH;
+  if (cacheKey.includes('analytics:') || cacheKey.includes('report:') || cacheKey.includes('stats:')) return CachePriority.LOW;
   return CachePriority.NORMAL;
 }
 
@@ -90,6 +90,10 @@ export class CacheService {
     onMetrics: ((m: CacheMetrics) => void) | undefined;
     metricsIntervalMs: number;
   };
+  /** Pre-computed once — opts.namespace never changes after construction. */
+  private readonly _namespace:      string;
+  /** Pre-computed once — disableRedis and redisHost never change after construction. */
+  private readonly _redisDisabled:  boolean;
   private readonly inflight    = new Map<string, Promise<unknown>>();
   private readonly revalidating = new Set<string>();
   private redis:               RedisClient | null = null;
@@ -98,6 +102,7 @@ export class CacheService {
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
   private metricsInterval:     ReturnType<typeof setInterval> | null = null;
+  private _shutdownHandler:    (() => void) | null = null;
   private readonly instanceId:       string;
   private readonly backplaneChannel: string;
   private subClient:           RedisClient | null = null;
@@ -130,7 +135,7 @@ export class CacheService {
 
     // Resolve encryption key: option > env var
     const encKeyRaw = options.encryptionKey ?? process.env.CACHE_ENCRYPTION_KEY;
-    this.enc = new CacheEncryption(encKeyRaw, logger);
+    this.enc = new CacheEncryption(encKeyRaw, logger, options.encryptionMode);
 
     // When a namespace is active, scope the forbidden prefixes so that
     // auth/session keys like `org_abc:auth:token` are still protected.
@@ -180,6 +185,9 @@ export class CacheService {
       logger,
     });
 
+    this._namespace     = ns;
+    this._redisDisabled = (this.opts.disableRedis || !this.opts.redisHost);
+
     // L1 in-memory cache
     this.l1 = new SmartMemoryCache({
       maxBytes:   this.opts.l1MaxBytes,
@@ -196,9 +204,9 @@ export class CacheService {
     }
 
     // Graceful shutdown: persist L1 to disk
-    const shutdown = () => { this.writeSnapshot(); process.exit(0); };
-    process.once('SIGTERM', shutdown);
-    process.once('SIGINT',  shutdown);
+    this._shutdownHandler = () => { this.writeSnapshot(); process.exit(0); };
+    process.once('SIGTERM', this._shutdownHandler);
+    process.once('SIGINT',  this._shutdownHandler);
 
     // Periodic cleanup (5 min)
     this.cleanupInterval = setInterval(() => {
@@ -287,17 +295,11 @@ export class CacheService {
    * receive and provide un-prefixed keys in the public API.
    */
   private nk(key: string): string {
-    return this.opts.namespace ? `${this.opts.namespace}:${key}` : key;
-  }
-
-  private isRedisDisabled(): boolean {
-    if (this.opts.disableRedis) return true;
-    if (!this.opts.redisHost)   return true;
-    return false;
+    return this._namespace ? `${this._namespace}:${key}` : key;
   }
 
   private initBackplane(): void {
-    if (!this.opts.invalidationBackplane || this.isRedisDisabled()) return;
+    if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     if (this.subClient) return;
 
     const sub = new RedisClient({
@@ -347,7 +349,7 @@ export class CacheService {
   }
 
   private async publishInvalidation(op: 'del' | 'del-glob', key: string): Promise<void> {
-    if (!this.opts.invalidationBackplane || this.isRedisDisabled()) return;
+    if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     try {
       const client = await this.getRedis();
       await client.publish(
@@ -490,36 +492,44 @@ export class CacheService {
       swr?:      number; // Stale-While-Revalidate grace period in seconds
     } = {},
   ): Promise<T> {
-    const ttlMs        = ttlSeconds * 1_000;
-    const swrGraceMs   = (opts.swr ?? 0) * 1_000;
-    const priority     = opts.priority ?? inferPriority(cacheKey); // original key for correct prefix inference
-    const k            = this.nk(cacheKey); // namespaced key used for all storage
+    const k = this.nk(cacheKey); // namespaced key used for all storage
     this.counters.gets++;
 
-    // L1: in-memory (fastest)
+    // L1: in-memory (fastest path — defer inferPriority / ttlMs until we confirm a miss;
+    // inferPriority runs 3 regex tests that are wasted work on every warm hit)
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
-      if (l1Hit.isStale && swrGraceMs > 0 && !this.revalidating.has(k)) {
-        this.revalidating.add(k);
-        void this._revalidate(k, fetchFn, ttlMs, swrGraceMs, priority);
-        this.counters.swrRevalidations++;
-        this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
+      if (l1Hit.isStale) {
+        const swrGraceMs = (opts.swr ?? 0) * 1_000;
+        if (swrGraceMs > 0 && !this.revalidating.has(k)) {
+          const priority = opts.priority ?? inferPriority(cacheKey);
+          this.revalidating.add(k);
+          void this._revalidate(k, fetchFn, ttlSeconds * 1_000, swrGraceMs, priority);
+          this.counters.swrRevalidations++;
+          this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
+        } else {
+          this.logger.debug('L1 hit');
+        }
       } else {
-        this.logger.debug('L1 hit', { cacheKey });
+        this.logger.debug('L1 hit');
       }
       this.counters.l1Hits++;
       return l1Hit.value as T;
     }
 
+    const ttlMs      = ttlSeconds * 1_000;
+    const swrGraceMs = (opts.swr ?? 0) * 1_000;
+    const priority   = opts.priority ?? inferPriority(cacheKey); // original key for correct prefix inference
+
     // L2: Redis (distributed, production-only by default)
-    if (!this.isRedisDisabled()) {
+    if (!this._redisDisabled) {
       try {
         const client = await this.getRedis();
         const raw    = await client.get(k);
         if (raw) {
           const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
           const parsed    = JSON.parse(decrypted) as T;
-          this.l1.set(k, parsed, ttlMs, { priority });
+          this.l1.set(k, parsed, ttlMs, priority);
           this.counters.l2Hits++;
           this.logger.debug('L2 hit (Redis)', { cacheKey });
           return parsed;
@@ -561,9 +571,9 @@ export class CacheService {
         const staleAt  = swrGraceMs > 0 ? Date.now() + ttlMs : undefined;
         const storeTtl = swrGraceMs > 0 ? ttlMs + swrGraceMs : ttlMs;
 
-        this.l1.set(k, data, storeTtl, { priority, staleAt });
+        this.l1.set(k, data, storeTtl, priority, staleAt);
 
-        if (!this.isRedisDisabled()) {
+        if (!this._redisDisabled) {
           try {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
@@ -597,9 +607,9 @@ export class CacheService {
     try {
       const data    = await fetchFn();
       const staleAt = Date.now() + ttlMs;
-      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, { priority, staleAt });
+      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt);
 
-      if (!this.isRedisDisabled()) {
+      if (!this._redisDisabled) {
         try {
           const client = await this.getRedis();
           const s      = JSON.stringify(data);
@@ -623,9 +633,9 @@ export class CacheService {
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
-    this.l1.set(k, data, ttlMs, { priority: p });
+    this.l1.set(k, data, ttlMs, p);
 
-    if (!this.isRedisDisabled()) {
+    if (!this._redisDisabled) {
       try {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
@@ -658,7 +668,7 @@ export class CacheService {
       this.disk.delete(k);
     }
 
-    if (!this.isRedisDisabled()) {
+    if (!this._redisDisabled) {
       try {
         const client = await this.getRedis();
         if (isPattern) {
@@ -688,7 +698,7 @@ export class CacheService {
    * Returns 0 if Redis is disabled (safe fallback — rate limiting won't block in dev).
    */
   async increment(cacheKey: string, ttlSeconds?: number): Promise<number> {
-    if (this.isRedisDisabled()) return 0;
+    if (this._redisDisabled) return 0;
     const k = this.nk(cacheKey);
     try {
       const client = await this.getRedis();
@@ -752,7 +762,7 @@ export class CacheService {
       },
 
       backplane: {
-        enabled:  this.opts.invalidationBackplane && !this.isRedisDisabled(),
+        enabled:  this.opts.invalidationBackplane && !this._redisDisabled,
         sent:     c.invSent,
         received: c.invReceived,
         skipped:  c.invSkipped,
@@ -838,6 +848,11 @@ export class CacheService {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this.oomInterval)     clearInterval(this.oomInterval);
     if (this.metricsInterval) clearInterval(this.metricsInterval);
+    if (this._shutdownHandler) {
+      process.off('SIGTERM', this._shutdownHandler);
+      process.off('SIGINT',  this._shutdownHandler);
+      this._shutdownHandler = null;
+    }
     if (this.subClient) {
       try { await this.subClient.quit(); } catch { /* ok */ }
       this.subClient = null;

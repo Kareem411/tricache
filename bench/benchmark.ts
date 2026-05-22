@@ -18,7 +18,8 @@
  *  7. OOM guard eviction latency
  *  8. delete / glob-delete cost
  *  9. metrics() snapshot overhead
- * 10. End-to-end: realistic workload (80% hot read, 15% cold miss, 5% write)
+ * 10. AES-256-GCM encryption overhead (string + buffer, 64B / 512B / 4 KB)
+ * 11. End-to-end: realistic workload (80% hot read, 15% cold miss, 5% write)
  *
  * Concurrency notes printed inline explain whether an operation is truly
  * concurrent, where the "lock" is (the inflight Map), and which path wins.
@@ -26,6 +27,7 @@
 
 import { CacheService }                 from '../src/cache-service';
 import { SmartMemoryCache }             from '../src/smart-memory-cache';
+import { CacheEncryption }              from '../src/encryption';
 import { CachePriority, consoleLogger } from '../src/types';
 import os   from 'os';
 import path from 'path';
@@ -195,43 +197,62 @@ const svc = CacheService.reset({
 header('L1 SmartMemoryCache — raw throughput');
 note('Single-threaded JS. No await. These numbers are your absolute ceiling.');
 
-for (let i = 0; i < 10_000; i++) {
-  l1.set(`hot:${i}`, { id: i, payload: 'x'.repeat(32) }, 60_000,
-    { priority: CachePriority.NORMAL });
+// Pool sizes are powers of 2 so the hot path can use a bitwise AND mask instead of
+// integer modulo. `i % n` requires a full CPU division; `i & MASK` is a single AND
+// instruction that V8's JIT emits inline without a helper call.
+const hotKeys     = Array.from({ length: 8_192 }, (_, i) => `hot:${i}`);
+const coldKeys    = Array.from({ length: 4_096 }, (_, i) => `never:${i}`);
+const tinyKeys    = Array.from({ length: 4_096 }, (_, i) => `s:${i}`);
+const tinyVals    = Array.from({ length: 4_096 }, (_, i) => ({ n: i }));
+const smallKeys   = Array.from({ length: 4_096 }, (_, i) => `b:${i}`);
+const smallVal    = { d: 'a'.repeat(480), n: 0 };
+const largeKeys   = Array.from({ length: 4_096 }, (_, i) => `l:${i}`);
+const largeVal    = { data: 'y'.repeat(2_048), rows: Array.from({ length: 20 }, (_, k) => ({ id: k })) };
+const critKeys    = Array.from({ length: 1_024 }, (_, i) => `auth:tok:${i}`);
+const critVal     = { token: 'x'.repeat(40) };
+const patternPool = Array.from({ length:   128 }, (_, i) => `s:${i}*`);
+
+// Precomputed masks (pool.length - 1, valid because sizes are powers of 2)
+const HOT_MASK  = hotKeys.length     - 1;  // 0x1FFF = 8191
+const COLD_MASK = coldKeys.length    - 1;  // 0x0FFF = 4095
+const KEY_MASK  = tinyKeys.length    - 1;  // 0x0FFF = 4095 — shared for tiny/small/large
+const CRIT_MASK = critKeys.length    - 1;  // 0x03FF = 1023
+const PAT_MASK  = patternPool.length - 1;  // 0x007F = 127
+
+for (let i = 0; i < hotKeys.length; i++) {
+  l1.set(hotKeys[i], { id: i, payload: 'x'.repeat(32) }, 60_000, CachePriority.NORMAL);
 }
 
-await bench('get — hot hit (10 K resident entries)', i => {
-  l1.get(`hot:${i % 10_000}`);
+await bench('get — hot hit (8 K resident entries)', i => {
+  l1.get(hotKeys[i & HOT_MASK]);
 }, 500_000, 5_000, 'bloom → Map lookup');
 
 await bench('get — cold miss (key never set)', i => {
-  l1.get(`never:${i}`);
+  l1.get(coldKeys[i & COLD_MASK]);
 }, 500_000, 5_000, 'bloom gates → early return');
 
 await bench('set — tiny  (< 512B, no compression)', i => {
-  l1.set(`s:${i % 5_000}`, { n: i }, 60_000);
+  l1.set(tinyKeys[i & KEY_MASK], tinyVals[i & KEY_MASK], 60_000);
 }, 200_000, 2_000, 'Map.set + bloom.add');
 
 await bench('set — small (≈ 512B, boundary)', i => {
-  l1.set(`b:${i % 5_000}`, { d: 'a'.repeat(480), n: i }, 60_000);
+  l1.set(smallKeys[i & KEY_MASK], smallVal, 60_000);
 }, 100_000, 1_000, 'JSON.stringify size check near threshold');
 
-const largeVal = { data: 'y'.repeat(2_048), rows: Array.from({ length: 20 }, (_, k) => ({ id: k })) };
 await bench('set — large (≥ 512B, msgpackr compress)', i => {
-  l1.set(`l:${i % 5_000}`, largeVal, 60_000);
+  l1.set(largeKeys[i & KEY_MASK], largeVal, 60_000);
 }, 100_000, 1_000, 'pack() + byte-size estimate');
 
 await bench('set — CRITICAL priority (never evicted)', i => {
-  l1.set(`auth:tok:${i % 1_000}`, { token: 'x'.repeat(40) }, 300_000,
-    { priority: CachePriority.CRITICAL });
+  l1.set(critKeys[i & CRIT_MASK], critVal, 300_000, CachePriority.CRITICAL);
 }, 100_000, 1_000, 'same path as NORMAL but skipped in eviction sort');
 
 await bench('delete — exact key', i => {
-  l1.delete(`hot:${i % 10_000}`);
+  l1.delete(hotKeys[i & HOT_MASK]);
 }, 100_000, 1_000, 'Map.delete (bloom has no remove)');
 
 await bench('deletePattern — glob wildcard', i => {
-  l1.deletePattern(`s:${i % 100}*`);
+  l1.deletePattern(patternPool[i & PAT_MASK]);
 }, 20_000, 200, 'full Map scan — O(n) linear');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,14 +263,20 @@ header('Bloom filter — cost breakdown');
 note('Bloom is O(k) per op (k=7 hash rounds). A definite-miss avoids a Map lookup entirely.');
 note('False positives still trigger a Map.get() that returns undefined — wasted work.');
 
-for (let i = 0; i < 10_000; i++) l1.set(`bf:${i}`, i, 60_000);
+// Pre-compute pools to eliminate string allocation on the hot path.
+const bfHotKeys  = Array.from({ length: 8_192 }, (_, i) => `bf:${i}`);
+const bfMissKeys = Array.from({ length: 4_096 }, (_, i) => `bloom-miss:novel-${i}`);
+const BF_HOT_MASK  = bfHotKeys.length  - 1;  // 8191
+const BF_MISS_MASK = bfMissKeys.length - 1;  // 4095
+
+for (let i = 0; i < bfHotKeys.length; i++) l1.set(bfHotKeys[i], i, 60_000);
 
 await bench('get — definite miss (novel key, never set)', i => {
-  l1.get(`bloom-miss:novel-${i}`);
+  l1.get(bfMissKeys[i & BF_MISS_MASK]);
 }, 500_000, 5_000, '7 hash rounds → bit check → return null');
 
 await bench('get — hit path (key confirmed in bloom)', i => {
-  l1.get(`bf:${i % 10_000}`);
+  l1.get(bfHotKeys[i & BF_HOT_MASK]);
 }, 500_000, 5_000, '7 hash rounds → Map.get → decompress if needed');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,9 +290,11 @@ note('Compressed entries save heap but cost ~1–3 µs per set. Reads pay unpack
 for (const sz of [128, 256, 512, 1_024, 4_096, 16_384] as const) {
   const val        = { payload: 'z'.repeat(sz), id: 42 };
   const compressed = sz >= 512;
+  const cmpKeys    = Array.from({ length: 2_048 }, (_, i) => `cmp:${sz}:${i}`);
+  const CMP_MASK   = cmpKeys.length - 1;  // 2047
   await bench(
     `set ${String(sz).padStart(6)}B payload`,
-    i => { l1.set(`cmp:${sz}:${i % 2_000}`, val, 60_000); },
+    i => { l1.set(cmpKeys[i & CMP_MASK], val, 60_000); },
     50_000, 500,
     compressed ? 'pack() path' : 'plain JSON path',
   );
@@ -541,6 +570,7 @@ await bench('toPrometheusText(metrics())', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  9. Realistic workload simulation
 // ─────────────────────────────────────────────────────────────────────────────
+// (section number preserved; encryption is §10 inserted after)
 
 header('Realistic workload — 80% hot read / 15% cold miss / 5% write');
 note('Simulates a typical web-server request fan-out with a warm cache.');
@@ -569,6 +599,192 @@ await benchParallel('Parallel realistic workload (20×)', realisticFn, 20, 1_000
 // ─────────────────────────────────────────────────────────────────────────────
 //  10. Final summary
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  10. AES-256-GCM encryption overhead
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('AES-256-GCM encryption — string (Redis) and buffer (disk) paths');
+note('IVs are pre-generated in a pool of 64. randomFillSync() fills the Buffer in-place — no allocation on refill.');
+note('Auth-tag generation and GCM finalisation are the dominant CPU cost per call.');
+note('Decrypt path has no randomBytes cost but must verify the 128-bit auth tag.');
+
+// Generate a deterministic 32-byte key for the benchmark (safe — not a real secret)
+const encKey = Buffer.alloc(32, 0xab).toString('base64'); // 32 × 0xab
+const enc = new CacheEncryption(encKey, { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} });
+
+// Cross-size JIT warmup: V8 compiles `encrypt`/`decrypt` against the first string/buffer
+// shapes it sees. Without this, switching from 64B → 512B mid-loop triggers a deopt +
+// recompile, inflating the 512B timed run. Warming all three sizes first gives the JIT
+// a stable polymorphic view before any measurements start.
+for (const wBytes of [64, 512, 4_096]) {
+  const ws  = 'x'.repeat(wBytes);
+  const wc  = enc.encrypt(ws);
+  const wb  = Buffer.alloc(wBytes, 0x42);
+  const wcb = enc.encryptBuffer(wb);
+  for (let i = 0; i < 300; i++) { enc.encrypt(ws); enc.decrypt(wc); enc.encryptBuffer(wb); enc.decryptBuffer(wcb); }
+}
+
+for (const bytes of [64, 512, 4_096] as const) {
+  const plainStr  = 'x'.repeat(bytes);
+  const cipherStr = enc.encrypt(plainStr);
+  const plainBuf  = Buffer.alloc(bytes, 0x42);
+  const cipherBuf = enc.encryptBuffer(plainBuf);
+
+  await bench(
+    `encrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { enc.encrypt(plainStr); },
+    50_000, 500,
+    'IV pool + GCM update/final + base64',
+  );
+  await bench(
+    `decrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { enc.decrypt(cipherStr); },
+    50_000, 500,
+    'base64 decode + GCM update/final + auth-tag verify',
+  );
+  await bench(
+    `encryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { enc.encryptBuffer(plainBuf); },
+    50_000, 500,
+    'IV pool + GCM + pre-alloc output buffer',
+  );
+  await bench(
+    `decryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { enc.decryptBuffer(cipherBuf); },
+    50_000, 500,
+    'magic check + GCM + auth-tag verify',
+  );
+}
+
+note('Rule of thumb: if encrypt latency > 50 µs, the bottleneck is likely GC from large');
+note('Buffer allocations — consider reusing IV buffers or batching writes.');
+
+// ─── AES-128-GCM ─────────────────────────────────────────────────────────────
+header('AES-128-GCM encryption — 10 cipher rounds vs 14 for AES-256. Same IV/tag overhead.');
+note('16-byte key. ~10% faster on non-AES-NI hardware; negligible difference with AES-NI.');
+note('Same AEAD guarantees as AES-256-GCM: authenticated encryption with 128-bit tag.');
+
+const enc128Key = Buffer.alloc(16, 0xab).toString('base64'); // 16 × 0xab
+const enc128 = new CacheEncryption(enc128Key, { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }, 'aes-128-gcm');
+
+for (const bytes of [64, 512, 4_096] as const) {
+  const plainStr128  = 'x'.repeat(bytes);
+  const cipherStr128 = enc128.encrypt(plainStr128);
+  const plainBuf128  = Buffer.alloc(bytes, 0x42);
+  const cipherBuf128 = enc128.encryptBuffer(plainBuf128);
+
+  await bench(
+    `[128] encrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { enc128.encrypt(plainStr128); },
+    50_000, 500,
+    'AES-128-GCM: IV pool + GCM update/final + base64',
+  );
+  await bench(
+    `[128] decrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { enc128.decrypt(cipherStr128); },
+    50_000, 500,
+    'base64 decode + GCM update/final + auth-tag verify',
+  );
+  await bench(
+    `[128] encryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { enc128.encryptBuffer(plainBuf128); },
+    50_000, 500,
+    'AES-128-GCM: IV pool + GCM + pre-alloc output buffer',
+  );
+  await bench(
+    `[128] decryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { enc128.decryptBuffer(cipherBuf128); },
+    50_000, 500,
+    'magic check + GCM + auth-tag verify',
+  );
+}
+
+// ─── AES-128-CTR ─────────────────────────────────────────────────────────────
+header('AES-128-CTR encryption — AES-NI keystream, no GHASH auth-tag computation.');
+note('16-byte key. Same AES-NI hardware path as GCM but skips the Galois-field MAC step.');
+note('Removes ~1–2 µs of GHASH overhead per call — biggest gain at large payloads.');
+note('No authentication: use only when integrity is guaranteed by transport (TLS, HMAC).');
+note('IV is the full 128-bit AES block (initial counter block), unlike 96-bit GCM IVs.');
+
+const encCtrKey = Buffer.alloc(16, 0xab).toString('base64'); // 16 × 0xab
+const encCtr = new CacheEncryption(encCtrKey, { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }, 'aes-128-ctr');
+
+for (const bytes of [64, 512, 4_096] as const) {
+  const plainStrCtr  = 'x'.repeat(bytes);
+  const cipherStrCtr = encCtr.encrypt(plainStrCtr);
+  const plainBufCtr  = Buffer.alloc(bytes, 0x42);
+  const cipherBufCtr = encCtr.encryptBuffer(plainBufCtr);
+
+  await bench(
+    `[ctr] encrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { encCtr.encrypt(plainStrCtr); },
+    50_000, 500,
+    'AES-128-CTR: IV pool + stream-cipher update + base64 (no GHASH)',
+  );
+  await bench(
+    `[ctr] decrypt (string)  ${String(bytes).padStart(5)}B`,
+    () => { encCtr.decrypt(cipherStrCtr); },
+    50_000, 500,
+    'base64 decode + CTR update (no auth-tag verify)',
+  );
+  await bench(
+    `[ctr] encryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { encCtr.encryptBuffer(plainBufCtr); },
+    50_000, 500,
+    'AES-128-CTR: IV pool + stream-cipher + pre-alloc output buffer (no GHASH)',
+  );
+  await bench(
+    `[ctr] decryptBuffer     ${String(bytes).padStart(5)}B`,
+    () => { encCtr.decryptBuffer(cipherBufCtr); },
+    50_000, 500,
+    'magic check + CTR update (no auth-tag verify)',
+  );
+}
+
+// ─── XOR obfuscation ──────────────────────────────────────────────────────────
+header('XOR obfuscation — NOT cryptographic. 32-bit word-level loop (4 B/iter) for 4-byte-aligned keys.');
+note('WARNING: XOR provides obfuscation only — it is NOT secure encryption.');
+note('Use for dev environments, hot-reload caches, or non-sensitive data only.');
+note('Self-inverse: encrypt(encrypt(x)) === x. No IV, no auth tag.');
+note('Fast path: readUInt32LE/writeUInt32LE compile to a single 32-bit XOR CPU instruction.');
+note('4× fewer loop iterations than byte-by-byte for 4-byte-aligned keys (16, 32 B).');
+note('Small payloads: no cipher context setup → dominates AES. Large: word XOR narrows the gap vs AES-NI.');
+
+const xorKey = Buffer.alloc(32, 0xcd).toString('base64'); // 32 × 0xcd
+const encXor = new CacheEncryption(xorKey, { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }, 'xor');
+
+for (const bytes of [64, 512, 4_096] as const) {
+  const plainStrXor  = 'x'.repeat(bytes);
+  const cipherStrXor = encXor.encrypt(plainStrXor);
+  const plainBufXor  = Buffer.alloc(bytes, 0x42);
+  const cipherBufXor = encXor.encryptBuffer(plainBufXor);
+
+  await bench(
+    `[xor] mask   (string)  ${String(bytes).padStart(5)}B`,
+    () => { encXor.encrypt(plainStrXor); },
+    100_000, 500,
+    'XOR obfuscation: utf8 → Buffer + 32-bit word XOR + base64',
+  );
+  await bench(
+    `[xor] unmask (string)  ${String(bytes).padStart(5)}B`,
+    () => { encXor.decrypt(cipherStrXor); },
+    100_000, 500,
+    'base64 decode + 32-bit word XOR + utf8 decode (self-inverse)',
+  );
+  await bench(
+    `[xor] maskBuffer       ${String(bytes).padStart(5)}B`,
+    () => { encXor.encryptBuffer(plainBufXor); },
+    100_000, 500,
+    'XOR obfuscation: 32-bit word XOR + pre-alloc output buffer',
+  );
+  await bench(
+    `[xor] unmaskBuffer     ${String(bytes).padStart(5)}B`,
+    () => { encXor.decryptBuffer(cipherBufXor); },
+    100_000, 500,
+    'magic check + 32-bit word XOR (self-inverse)',
+  );
+}
 
 divider();
 const fm = svc.metrics();
