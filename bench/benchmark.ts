@@ -18,8 +18,10 @@
  *  7. OOM guard eviction latency
  *  8. delete / glob-delete cost
  *  9. metrics() snapshot overhead
- * 10. AES-256-GCM encryption overhead (string + buffer, 64B / 512B / 4 KB)
- * 11. End-to-end: realistic workload (80% hot read, 15% cold miss, 5% write)
+ *  10. AES-256-GCM, AES-128-GCM, AES-128-CTR, XOR encryption overhead
+ * 11. Realistic workload simulation (80/15/5 read/miss/write)
+ * 12. Multi-tenancy: category competition (user: HIGH vs analytics: LOW)
+ *     and namespace isolation (org_a vs org_b independent throughput)
  *
  * Concurrency notes printed inline explain whether an operation is truly
  * concurrent, where the "lock" is (the inflight Map), and which path wins.
@@ -231,13 +233,13 @@ await bench('get — cold miss (key never set)', i => {
   l1.get(coldKeys[i & COLD_MASK]);
 }, 500_000, 5_000, 'bloom gates → early return');
 
-await bench('set — tiny  (< 512B, no compression)', i => {
+await bench('set — tiny  payload (always pack())', i => {
   l1.set(tinyKeys[i & KEY_MASK], tinyVals[i & KEY_MASK], 60_000);
-}, 200_000, 2_000, 'Map.set + bloom.add');
+}, 200_000, 2_000, 'pack() + Map.set + bloom.add');
 
-await bench('set — small (≈ 512B, boundary)', i => {
+await bench('set — small payload (≈ 512B)', i => {
   l1.set(smallKeys[i & KEY_MASK], smallVal, 60_000);
-}, 100_000, 1_000, 'JSON.stringify size check near threshold');
+}, 100_000, 1_000, 'pack() — same unified path as tiny, larger payload');
 
 await bench('set — large (≥ 512B, msgpackr compress)', i => {
   l1.set(largeKeys[i & KEY_MASK], largeVal, 60_000);
@@ -283,20 +285,19 @@ await bench('get — hit path (key confirmed in bloom)', i => {
 //  3. Compression cost vs savings
 // ─────────────────────────────────────────────────────────────────────────────
 
-header('Compression — size vs latency trade-off');
-note('msgpackr invoked when JSON.stringify(value).length >= 512 bytes.');
-note('Compressed entries save heap but cost ~1–3 µs per set. Reads pay unpack() cost.');
+header('Serialization — msgpackr pack() throughput by payload size');
+note('All payloads serialized via msgpackr pack() — no JSON path at any size.');
+note('Throughput falls with payload size: pack() must encode more bytes per call.');
 
 for (const sz of [128, 256, 512, 1_024, 4_096, 16_384] as const) {
-  const val        = { payload: 'z'.repeat(sz), id: 42 };
-  const compressed = sz >= 512;
-  const cmpKeys    = Array.from({ length: 2_048 }, (_, i) => `cmp:${sz}:${i}`);
-  const CMP_MASK   = cmpKeys.length - 1;  // 2047
+  const val     = { payload: 'z'.repeat(sz), id: 42 };
+  const cmpKeys = Array.from({ length: 2_048 }, (_, i) => `cmp:${sz}:${i}`);
+  const CMP_MASK = cmpKeys.length - 1;  // 2047
   await bench(
     `set ${String(sz).padStart(6)}B payload`,
     i => { l1.set(cmpKeys[i & CMP_MASK], val, 60_000); },
     50_000, 500,
-    compressed ? 'pack() path' : 'plain JSON path',
+    'pack() path',
   );
 }
 
@@ -786,6 +787,124 @@ for (const bytes of [64, 512, 4_096] as const) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  12. Multi-tenancy — category competition & namespace isolation
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Multi-tenancy — category competition & namespace isolation');
+note('Two categories share one L1: user: (HIGH priority, limit 200) vs analytics: (LOW, limit 100).');
+note('Category limits are soft — reservoir sampling biases eviction toward the overflowing category.');
+note('With a priority spread, HIGH-priority entries resist LOW-priority floods.');
+
+// ── 12a. Category starvation test ─────────────────────────────────────────
+
+const catL1 = new SmartMemoryCache({
+  maxBytes:   4 * 1024 * 1024,
+  maxEntries: 400,
+  categories: {
+    'user:':      { maxEntries: 200, maxSizeBytes: 2 * 1024 * 1024 },
+    'analytics:': { maxEntries: 100, maxSizeBytes: 1 * 1024 * 1024 },
+    'default':    { maxEntries: 100, maxSizeBytes: 1 * 1024 * 1024 },
+  },
+  logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+});
+
+// Fill user: to its 200-entry limit at HIGH priority
+for (let i = 0; i < 200; i++) {
+  catL1.set(`user:${i}`, { id: i, name: `u${i}` }, 300_000, CachePriority.HIGH);
+}
+const userCountBefore = catL1.getStats().categories['user:'] ?? 0;
+
+// Flood analytics: well beyond its 100-entry limit at LOW priority.
+// Each set() triggers ensureCapacity → smartEvict → 4 entries evicted from
+// 16-sampled pool. analytics: entries carry a -100 score penalty (catBonus)
+// so they are preferentially selected over HIGH-priority user: entries.
+const analFloodKeys = Array.from({ length: 2_048 }, (_, i) => `analytics:${i}`);
+const ANAL_FLOOD_MASK = analFloodKeys.length - 1;
+
+await bench(
+  'analytics: flood beyond limit into full L1',
+  i => { catL1.set(analFloodKeys[i & ANAL_FLOOD_MASK], { report: i, d: 'a'.repeat(64) }, 60_000, CachePriority.LOW); },
+  10_000, 100,
+  'analytics: catBonus → score penalty → preferentially self-evicted',
+);
+
+{
+  const statsPost = catL1.getStats();
+  const userAfter = statsPost.categories['user:']      ?? 0;
+  const analAfter = statsPost.categories['analytics:'] ?? 0;
+  const userLost  = userCountBefore - userAfter;
+  const protection = ((1 - userLost / Math.max(1, userCountBefore)) * 100).toFixed(1);
+  console.log(`  ${C.dim}  user: before → after analytics: flood: ${userCountBefore} → ${userAfter} (${userLost} evicted)${C.reset}`);
+  console.log(`  ${C.dim}  analytics: entries stabilised at: ${analAfter} / 100 limit${C.reset}`);
+  const colour = parseFloat(protection) >= 90 ? C.green : C.yellow;
+  console.log(`  ${C.dim}  user: protection rate: ${colour}${protection}%${C.reset}${C.dim} — ${parseFloat(protection) >= 90 ? 'HIGH priority effective against LOW flood' : 'cross-category starvation visible — consider lower writeRatio or higher priority delta'}${C.reset}`);
+}
+
+// ── 12b. Get throughput after flooding ─────────────────────────────────────
+
+// Re-warm user: entries that may have been evicted
+for (let i = 0; i < 64; i++) catL1.set(`user:${i}`, { id: i }, 300_000, CachePriority.HIGH);
+
+const catHotUserKeys = Array.from({ length: 64 }, (_, i) => `user:${i}`);
+const CAT_USER_MASK  = catHotUserKeys.length - 1;
+
+await bench(
+  'get user: hot hit — after analytics: flood',
+  i => { catL1.get(catHotUserKeys[i & CAT_USER_MASK]); },
+  200_000, 2_000,
+  'bloom → Map.get; HIGH-priority entries re-warm instantly',
+);
+
+// ── 12c. Namespace isolation correctness check ─────────────────────────────
+
+const nsADir = makeTempDir();
+const nsBDir = makeTempDir();
+
+const nsA = CacheService.reset({ namespace: 'org_a', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsADir });
+const nsB = CacheService.reset({ namespace: 'org_b', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsBDir });
+
+await nsA.set('user:1', { tenant: 'A' }, 300);
+await nsB.set('user:1', { tenant: 'B' }, 300);
+
+// Delete from org_a — must not affect org_b's copy of the same key
+await nsA.delete('user:1');
+const aMiss = await nsA.get('user:1', async () => null, 1);
+const bHit  = await nsB.get('user:1', async () => null, 1) as { tenant: string } | null;
+const isIsolated = aMiss === null && bHit?.tenant === 'B';
+console.log(
+  `  ${C.dim}  Key isolation: org_a.delete('user:1') → org_b still holds value — ` +
+  (isIsolated ? `${C.green}✓ isolated${C.reset}` : `${C.red}✗ leaked to org_b${C.reset}`)
+);
+
+// ── 12d. Namespace throughput parity ──────────────────────────────────────
+
+header('  12d. Namespace throughput parity — two tenants, same 80/15/5 workload');
+note('  Each namespace has its own L1, disk dir, inflight Map, and pub/sub channel.');
+note('  Throughput should be ~identical — no shared mutable state between instances.');
+
+const NS_HOT = 500;
+for (let i = 0; i < NS_HOT; i++) {
+  await nsA.set(`hot:${i}`, { v: i }, 300);
+  await nsB.set(`hot:${i}`, { v: i }, 300);
+}
+
+const nsMixed = (ns: CacheService) => async (i: number): Promise<void> => {
+  const r = Math.random();
+  if      (r < 0.80) { await ns.get(`hot:${i % NS_HOT}`,  async () => ({ v: i }), 300); }
+  else if (r < 0.95) { await ns.get(`miss:${i % 100}`, async () => ({ v: i }), 5); }
+  else               { await ns.set(`hot:${i % NS_HOT}`,  { v: i }, 300); }
+};
+
+const nsResA = await bench('  org_a — 80/15/5 workload', nsMixed(nsA), 10_000, 200, 'independent L1 + disk + inflight Map');
+const nsResB = await bench('  org_b — 80/15/5 workload', nsMixed(nsB), 10_000, 200, 'independent L1 + disk + inflight Map');
+console.log(
+  `  ${C.dim}  Throughput ratio A/B: ${(nsResA.opsPerSec / nsResB.opsPerSec).toFixed(2)}× — expect ≈ 1.0 (fully independent)${C.reset}`
+);
+
+await nsA.destroy();
+await nsB.destroy();
+
 divider();
 const fm = svc.metrics();
 console.log(`\n${C.bold}  Final cache state${C.reset}`);
@@ -816,6 +935,6 @@ console.log(`  ${C.dim}• eviction >>10× headroom  → cache is over-full; inc
 console.log('');
 
 await svc.destroy();
-cleanup(benchDir, evictDir, oomDir);
+cleanup(benchDir, evictDir, oomDir, nsADir, nsBDir);
 process.exit(0);
 
