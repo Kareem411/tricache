@@ -507,7 +507,7 @@ for (let i = 0; i < 200; i++) await tightSvc.set(`evict:fill:${i}`, { i }, 300);
 const evictRes = await bench(
   'set — L1 full, eviction on every set',
   async i => { await tightSvc.set(`evict:over:${i}`, { n: i, data: 'z'.repeat(256) }, 300); },
-  5_000, 50, 'O(n log n) sort on 200 entries per call',
+  5_000, 50, 'O(catSize) categoryKeys scan + O(16 log 16) sort; Phase 2 skipped when catOvf',
 );
 
 console.log(

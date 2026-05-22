@@ -119,6 +119,8 @@ export class SmartMemoryCache {
   private totalSize                  = 0;
   private categoryCount              = new Map<string, number>();
   private categorySize               = new Map<string, number>();
+  /** Per-category key sets — enables O(catSize) Phase-1 reservoir sampling without an O(N) scan. */
+  private categoryKeys               = new Map<string, Set<string>>();
 
   // ── Observability counters ──────────────────────────────────────────────────────
   private bloomChecks           = 0;
@@ -146,11 +148,15 @@ export class SmartMemoryCache {
     this.totalSize = 0;
     this.categoryCount.clear();
     this.categorySize.clear();
+    this.categoryKeys.clear();
     for (const [key, entry] of this.cache) {
       this.totalSize += entry.size;
       const cat = this.getCategory(key);
       this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 0) + 1);
       this.categorySize.set(cat, (this.categorySize.get(cat) ?? 0) + entry.size);
+      let ks = this.categoryKeys.get(cat);
+      if (!ks) { ks = new Set(); this.categoryKeys.set(cat, ks); }
+      ks.add(key);
     }
   }
 
@@ -172,6 +178,7 @@ export class SmartMemoryCache {
     this.totalSize -= entry.size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 1) - 1);
     this.categorySize.set(cat, (this.categorySize.get(cat) ?? entry.size) - entry.size);
+    this.categoryKeys.get(cat)?.delete(key);
     this._bloomDirtyCount++;
     return this.cache.delete(key);
   }
@@ -227,46 +234,51 @@ export class SmartMemoryCache {
     const pool: Array<{ key: string; score: number }> = [];
 
     if (catOvf) {
-      // Phase 1 — category-local reservoir sample.
-      // Guarantees at least min(catSize, EVICT) entries from the overflowing category
-      // are in the pool, eliminating the statistical leak that occurs when global
-      // sampling under-represents the overflow category by chance.
-      // Without this, ~17% of eviction rounds (at 100/300 analytics: density) would
-      // sample fewer than EVICT analytics: candidates and evict cross-category
-      // HIGH-priority entries despite the 2000-point priority gap.
-      let catSeen = 0;
-      for (const [key, entry] of this.cache) {
-        if (this.getCategory(key) !== targetCat) continue;
-        if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-        catSeen++;
-        const s = this.score(entry, 100, now);
-        if (pool.length < EVICT) {
-          pool.push({ key, score: s });
-        } else {
-          const j = Math.floor(Math.random() * catSeen);
-          if (j < EVICT) pool[j] = { key, score: s };
+      // Phase 1 — O(catSize) category-local reservoir sample.
+      // Uses the categoryKeys index to iterate only the overflowing category's keys,
+      // avoiding an O(N) scan of the entire cache. Guarantees at least
+      // min(catSize, EVICT) entries from the overflowing category in the pool so
+      // the priority score ordering is always deterministic in practice.
+      const catKeySet = this.categoryKeys.get(targetCat);
+      if (catKeySet) {
+        let catSeen = 0;
+        for (const key of catKeySet) {
+          const entry = this.cache.get(key);
+          if (!entry || (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now)) continue;
+          catSeen++;
+          const s = this.score(entry, 100, now);
+          if (pool.length < EVICT) {
+            pool.push({ key, score: s });
+          } else {
+            const j = Math.floor(Math.random() * catSeen);
+            if (j < EVICT) pool[j] = { key, score: s };
+          }
         }
       }
     }
 
     // Phase 2 — global reservoir sample fills remaining SAMPLE-pool.length slots.
+    // Skipped entirely when Phase 1 already collected a full EVICT-sized pool
+    // (the common catOvf case — overflowing categories always have ≥ EVICT entries).
     // Also the sole phase when !catOvf (global over-capacity, no preferred category).
-    const remaining = SAMPLE - pool.length;
-    let globalSeen  = 0;
-    const globalPool: Array<{ key: string; score: number }> = [];
-    for (const [key, entry] of this.cache) {
-      if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-      if (catOvf && this.getCategory(key) === targetCat) continue; // already sampled above
-      globalSeen++;
-      const s = this.score(entry, 0, now);
-      if (globalPool.length < remaining) {
-        globalPool.push({ key, score: s });
-      } else {
-        const j = Math.floor(Math.random() * globalSeen);
-        if (j < remaining) globalPool[j] = { key, score: s };
+    if (pool.length < EVICT) {
+      const remaining = SAMPLE - pool.length;
+      let globalSeen  = 0;
+      const globalPool: Array<{ key: string; score: number }> = [];
+      for (const [key, entry] of this.cache) {
+        if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
+        if (catOvf && this.getCategory(key) === targetCat) continue; // already sampled above
+        globalSeen++;
+        const s = this.score(entry, 0, now);
+        if (globalPool.length < remaining) {
+          globalPool.push({ key, score: s });
+        } else {
+          const j = Math.floor(Math.random() * globalSeen);
+          if (j < remaining) globalPool[j] = { key, score: s };
+        }
       }
+      pool.push(...globalPool);
     }
-    pool.push(...globalPool);
 
     if (pool.length === 0) return;
 
@@ -333,6 +345,9 @@ export class SmartMemoryCache {
     this.totalSize += size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 0) + 1);
     this.categorySize.set(cat,  (this.categorySize.get(cat)  ?? 0) + size);
+    let ks = this.categoryKeys.get(cat);
+    if (!ks) { ks = new Set(); this.categoryKeys.set(cat, ks); }
+    ks.add(key);
   }
 
   delete(key: string): boolean {
