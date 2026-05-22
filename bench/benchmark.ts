@@ -793,8 +793,9 @@ for (const bytes of [64, 512, 4_096] as const) {
 
 header('Multi-tenancy — category competition & namespace isolation');
 note('Two categories share one L1: user: (HIGH priority, limit 200) vs analytics: (LOW, limit 100).');
-note('Category limits are soft — reservoir sampling biases eviction toward the overflowing category.');
-note('With a priority spread, HIGH-priority entries resist LOW-priority floods.');
+note('Category limits are soft — two-phase reservoir sampling ensures the overflowing category');
+note('is always represented in the eviction pool (≥ EVICT candidates from that category first).');
+note('With a priority spread, HIGH-priority entries reliably resist LOW-priority floods.');
 
 // ── 12a. Category starvation test ─────────────────────────────────────────
 
@@ -826,7 +827,7 @@ await bench(
   'analytics: flood beyond limit into full L1',
   i => { catL1.set(analFloodKeys[i & ANAL_FLOOD_MASK], { report: i, d: 'a'.repeat(64) }, 60_000, CachePriority.LOW); },
   10_000, 100,
-  'analytics: catBonus → score penalty → preferentially self-evicted',
+  'two-phase sampling: category-local phase guarantees ≥ EVICT overflowing entries in pool',
 );
 
 {
@@ -838,7 +839,7 @@ await bench(
   console.log(`  ${C.dim}  user: before → after analytics: flood: ${userCountBefore} → ${userAfter} (${userLost} evicted)${C.reset}`);
   console.log(`  ${C.dim}  analytics: entries stabilised at: ${analAfter} / 100 limit${C.reset}`);
   const colour = parseFloat(protection) >= 90 ? C.green : C.yellow;
-  console.log(`  ${C.dim}  user: protection rate: ${colour}${protection}%${C.reset}${C.dim} — ${parseFloat(protection) >= 90 ? 'HIGH priority effective against LOW flood' : 'cross-category starvation visible — consider lower writeRatio or higher priority delta'}${C.reset}`);
+  console.log(`  ${C.dim}  user: protection rate: ${colour}${protection}%${C.reset}${C.dim} — ${parseFloat(protection) >= 90 ? 'HIGH priority effective against LOW flood (two-phase sampling working)' : 'cross-category starvation visible — two-phase sampling may need larger EVICT window'}${C.reset}`);
 }
 
 // ── 12b. Get throughput after flooding ─────────────────────────────────────

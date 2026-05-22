@@ -224,37 +224,59 @@ export class SmartMemoryCache {
     const SAMPLE = 16; // Redis-style sample window
     const EVICT  = Math.max(1, Math.ceil(SAMPLE * EVICTION_BATCH_PERCENT)); // ~4
 
-    // Reservoir-sample SAMPLE non-critical candidates in one O(n) pass instead
-    // of building the full candidate array then sorting it O(n log n).  The
-    // sort that follows operates on at most SAMPLE=16 elements — effectively O(1).
     const pool: Array<{ key: string; score: number }> = [];
-    let seen = 0;
-    for (const [key, entry] of this.cache) {
-      if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-      seen++;
-      const bonus = catOvf && this.getCategory(key) === targetCat ? 100 : 0;
-      const s     = this.score(entry, bonus, now);
-      if (pool.length < SAMPLE) {
-        pool.push({ key, score: s });
-      } else {
-        // Reservoir sampling: replace with probability SAMPLE/seen
-        const j = Math.floor(Math.random() * seen);
-        if (j < SAMPLE) pool[j] = { key, score: s };
+
+    if (catOvf) {
+      // Phase 1 — category-local reservoir sample.
+      // Guarantees at least min(catSize, EVICT) entries from the overflowing category
+      // are in the pool, eliminating the statistical leak that occurs when global
+      // sampling under-represents the overflow category by chance.
+      // Without this, ~17% of eviction rounds (at 100/300 analytics: density) would
+      // sample fewer than EVICT analytics: candidates and evict cross-category
+      // HIGH-priority entries despite the 2000-point priority gap.
+      let catSeen = 0;
+      for (const [key, entry] of this.cache) {
+        if (this.getCategory(key) !== targetCat) continue;
+        if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
+        catSeen++;
+        const s = this.score(entry, 100, now);
+        if (pool.length < EVICT) {
+          pool.push({ key, score: s });
+        } else {
+          const j = Math.floor(Math.random() * catSeen);
+          if (j < EVICT) pool[j] = { key, score: s };
+        }
       }
     }
 
+    // Phase 2 — global reservoir sample fills remaining SAMPLE-pool.length slots.
+    // Also the sole phase when !catOvf (global over-capacity, no preferred category).
+    const remaining = SAMPLE - pool.length;
+    let globalSeen  = 0;
+    const globalPool: Array<{ key: string; score: number }> = [];
+    for (const [key, entry] of this.cache) {
+      if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
+      if (catOvf && this.getCategory(key) === targetCat) continue; // already sampled above
+      globalSeen++;
+      const s = this.score(entry, 0, now);
+      if (globalPool.length < remaining) {
+        globalPool.push({ key, score: s });
+      } else {
+        const j = Math.floor(Math.random() * globalSeen);
+        if (j < remaining) globalPool[j] = { key, score: s };
+      }
+    }
+    pool.push(...globalPool);
+
     if (pool.length === 0) return;
 
-    // Sort only the tiny sample (O(SAMPLE * log(SAMPLE)) ≈ 64 comparisons)
+    // Sort only the tiny merged pool (O(SAMPLE * log(SAMPLE)) ≈ 64 comparisons)
     pool.sort((a, b) => a.score - b.score);
-    let evicted = 0;
     for (const { key } of pool.slice(0, EVICT)) {
       const entry = this.cache.get(key);
       if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry); // L1.5 spill
       this._delete(key);
-      evicted++;
     }
-
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
