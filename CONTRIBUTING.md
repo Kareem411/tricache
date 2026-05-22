@@ -57,3 +57,15 @@ Open a [GitHub Issue](https://github.com/Kareem411/tricache/issues) with:
 - Expected vs actual behaviour
 
 For security vulnerabilities, see [SECURITY.md](SECURITY.md).
+
+## Releasing a new version
+
+1. Bump the version in `package.json`
+2. Commit: `git commit -m "chore: bump version to X.Y.Z"`
+3. Tag and push:
+   ```bash
+   git tag vX.Y.Z
+   git push origin master --tags
+   ```
+
+The CI will automatically run tests, publish to npm, and create a GitHub Release with auto-generated release notes.
