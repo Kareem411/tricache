@@ -30,6 +30,8 @@ class JsBloomFilter {
   private bits: Buffer;
   private readonly numBits: number;
   private readonly k: number;
+  /** Tracks total add() calls so we know when phantom bits have saturated the filter. */
+  private _insertionCount = 0;
 
   constructor(numBits = 100_000, k = 7) {
     this.numBits = numBits;
@@ -55,6 +57,7 @@ class JsBloomFilter {
   add(key: string): void {
     const h1 = this.fnv1a32(key), h2 = this.djb2(key);
     for (let i = 0; i < this.k; i++) this.setBit(((h1 + i * h2) >>> 0) % this.numBits);
+    this._insertionCount++;
   }
 
   mightContain(key: string): boolean {
@@ -63,8 +66,21 @@ class JsBloomFilter {
     return true;
   }
 
-  reset()                          { this.bits.fill(0); }
-  rebuild(keys: Iterable<string>)  { this.bits.fill(0); for (const k of keys) this.add(k); }
+  reset()                          { this.bits.fill(0); this._insertionCount = 0; }
+  rebuild(keys: Iterable<string>)  { this.bits.fill(0); this._insertionCount = 0; for (const k of keys) this.add(k); }
+
+  /** Number of add() calls since last reset/rebuild. */
+  get insertions(): number { return this._insertionCount; }
+
+  /**
+   * Maximum safe insertions before false-positive rate exceeds ~1 %.
+   * Exact formula for the configured k and target p=1 %:
+   *   n_max = -m * ln(1 - p^(1/k)) / k
+   */
+  get maxCapacity(): number {
+    const p = 0.01;
+    return Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / this.k)) / this.k);
+  }
 
   get stats(): { bitsSet: number; fillFactor: number } {
     let bitsSet = 0;
@@ -174,26 +190,55 @@ export class SmartMemoryCache {
     return entry.priority * 1000 + freq * 10 + ttl / 60000 - age / 60000 - catBonus;
   }
 
+  /**
+   * Rebuild the bloom filter when phantom bits from deleted/expired keys have
+   * pushed the insertion count past the filter's ~1 % FP capacity threshold.
+   * A rebuild anchors the bit-array to only live cache keys, instantly restoring
+   * accuracy.  Cost: O(cache.size) — only triggered when truly needed.
+   */
+  private maybeRebuildBloom(): void {
+    if (this.bloom.insertions > this.bloom.maxCapacity) {
+      this.bloom.rebuild(this.cache.keys());
+    }
+  }
+
   private smartEvict(targetCat: string, catOvf: boolean): void {
-    const now = Date.now();
-    const candidates: Array<{ key: string; score: number }> = [];
+    const now    = Date.now();
+    const SAMPLE = 16; // Redis-style sample window
+    const EVICT  = Math.max(1, Math.ceil(SAMPLE * EVICTION_BATCH_PERCENT)); // ~4
+
+    // Reservoir-sample SAMPLE non-critical candidates in one O(n) pass instead
+    // of building the full candidate array then sorting it O(n log n).  The
+    // sort that follows operates on at most SAMPLE=16 elements — effectively O(1).
+    const pool: Array<{ key: string; score: number }> = [];
+    let seen = 0;
     for (const [key, entry] of this.cache) {
       if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-      const cat   = this.getCategory(key);
-      const bonus = catOvf && cat === targetCat ? 100 : 0;
-      candidates.push({ key, score: this.score(entry, bonus, now) });
+      seen++;
+      const bonus = catOvf && this.getCategory(key) === targetCat ? 100 : 0;
+      const s     = this.score(entry, bonus, now);
+      if (pool.length < SAMPLE) {
+        pool.push({ key, score: s });
+      } else {
+        // Reservoir sampling: replace with probability SAMPLE/seen
+        const j = Math.floor(Math.random() * seen);
+        if (j < SAMPLE) pool[j] = { key, score: s };
+      }
     }
-    candidates.sort((a, b) => a.score - b.score);
-    const evictCount = Math.max(1, Math.floor(candidates.length * EVICTION_BATCH_PERCENT));
+
+    if (pool.length === 0) return;
+
+    // Sort only the tiny sample (O(SAMPLE * log(SAMPLE)) ≈ 64 comparisons)
+    pool.sort((a, b) => a.score - b.score);
     let evicted = 0;
-    for (const { key } of candidates.slice(0, evictCount)) {
+    for (const { key } of pool.slice(0, EVICT)) {
       const entry = this.cache.get(key);
       if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry); // L1.5 spill
       this._delete(key);
       evicted++;
     }
     this.opts.logger.debug('SmartMemoryCache: eviction', {
-      evicted, reason: catOvf ? 'category' : 'global', targetCat,
+      evicted, sampleSize: pool.length, reason: catOvf ? 'category' : 'global', targetCat,
       remaining: this.cache.size, sizeKB: Math.round(this.totalSize / 1024),
     });
   }
@@ -254,6 +299,7 @@ export class SmartMemoryCache {
 
     this.cache.set(key, { data: entryData, isCompressed, expiresAt: Date.now() + ttlMs, staleAt, size, hits: 1, lastAccess: Date.now(), priority });
     this.bloom.add(key);
+    this.maybeRebuildBloom();
     this.totalSize += size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 0) + 1);
     this.categorySize.set(cat,  (this.categorySize.get(cat)  ?? 0) + size);

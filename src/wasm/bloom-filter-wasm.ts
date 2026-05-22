@@ -49,6 +49,8 @@ export class WasmBloomFilter {
   private readonly mem: Uint8Array;
   private readonly encoder = new TextEncoder();
   private readonly numBits = 100_000;
+  /** Tracks total add() calls so we know when phantom bits have saturated the filter. */
+  private _insertionCount = 0;
 
   constructor() {
     const instance = instantiateSync();
@@ -69,6 +71,7 @@ export class WasmBloomFilter {
     const len = this.writeKey(key);
     if (len === 0) return;
     this.exports.add(KEY_STAGING_OFFSET, len);
+    this._insertionCount++;
   }
 
   mightContain(key: string): boolean {
@@ -77,7 +80,7 @@ export class WasmBloomFilter {
     return this.exports.mightContain(KEY_STAGING_OFFSET, len) === 1;
   }
 
-  reset(): void { this.exports.reset(); }
+  reset(): void { this.exports.reset(); this._insertionCount = 0; }
 
   rebuild(keys: Iterable<string>): void {
     this.reset();
@@ -86,5 +89,18 @@ export class WasmBloomFilter {
 
   get stats(): { bitsSet: number; fillFactor: number } {
     return { bitsSet: this.exports.countBits(), fillFactor: this.exports.countBits() / this.numBits };
+  }
+
+  /** Number of add() calls since last reset/rebuild. */
+  get insertions(): number { return this._insertionCount; }
+
+  /**
+   * Maximum safe insertions before false-positive rate exceeds ~1 %.
+   * Exact formula for k=7 hash rounds, m=100 000 bits:
+   *   n_max = -m * ln(1 - p^(1/k)) / k  ≈ 18 169
+   */
+  get maxCapacity(): number {
+    const k = 7, p = 0.01;
+    return Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / k)) / k);
   }
 }

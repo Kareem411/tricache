@@ -451,7 +451,8 @@ for (const [label, writeRatio] of ratios) {
 
 header('Eviction pressure — L1 over-capacity behaviour');
 note('Eviction is triggered when entries > maxEntries or sizeBytes > maxBytes.');
-note('The eviction sort is O(n log n) over non-CRITICAL entries — the primary bottleneck.');
+note('Now uses reservoir sampling: O(n) pass + O(16 log 16) sort instead of O(n log n) full sort.');
+note('At small n the dominant cost is synchronous msgpackr pack() per spill (before first await).');
 note('Evicted entries spill to disk asynchronously (fire-and-forget, non-blocking).');
 
 const evictDir = makeTempDir();

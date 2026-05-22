@@ -171,6 +171,7 @@ describe('CacheService.metrics()', () => {
 
   it('reports correct namespace and l1 size', async () => {
     await svc.set('ns:x', { payload: 'data' }, 60);
+    await new Promise(r => setTimeout(r, 2)); // ensure ≥1 ms uptime before asserting
     const m = svc.metrics();
     expect(m.namespace).toBe('');
     expect(m.l1.entries).toBeGreaterThan(0);
