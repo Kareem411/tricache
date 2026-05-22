@@ -74,15 +74,48 @@ export class DiskTier {
     this.usageCounted = true;
     try {
       this.ensureDir();
-      const files = fs.readdirSync(this.opts.dir);
       let total = 0;
-      for (const f of files) { try { total += fs.statSync(path.join(this.opts.dir, f)).size; } catch { /* ok */ } }
+      for (const filePath of this.walkCacheFiles()) {
+        try { total += fs.statSync(filePath).size; } catch { /* ok */ }
+      }
       this.diskUsageBytes = total;
     } catch { this.diskUsageBytes = 0; }
   }
 
+  /**
+   * Map a cache key to its on-disk path.
+   *
+   * Files are sharded into two-character hex prefix subdirectories to avoid
+   * putting thousands of flat files into a single directory node — which
+   * degrades EXT4/NTFS performance at scale.
+   *
+   *   key  → SHA-256 hex  e3b0c442...
+   *   path → {dir}/e3/e3b0c442...
+   */
   private keyToPath(key: string): string {
-    return path.join(this.opts.dir, crypto.createHash('sha256').update(key, 'utf8').digest('hex'));
+    const hash = crypto.createHash('sha256').update(key, 'utf8').digest('hex');
+    return path.join(this.opts.dir, hash.slice(0, 2), hash);
+  }
+
+  /**
+   * Recursively list all cache file paths across the 2-level sharded subdirs.
+   * Top-level entries that are not directories are skipped (e.g. stale flat
+   * files written by older versions).
+   */
+  private walkCacheFiles(): string[] {
+    const results: string[] = [];
+    let topEntries: string[];
+    try { topEntries = fs.readdirSync(this.opts.dir); } catch { return results; }
+    for (const top of topEntries) {
+      const topPath = path.join(this.opts.dir, top);
+      try {
+        if (!fs.statSync(topPath).isDirectory()) continue;
+        for (const file of fs.readdirSync(topPath)) {
+          results.push(path.join(topPath, file));
+        }
+      } catch { /* skip locked/gone */ }
+    }
+    return results;
   }
 
   private isForbidden(key: string): boolean {
@@ -114,8 +147,21 @@ export class DiskTier {
 
   // ── Public API ────────────────────────────────────────────────────────────
 
-  /** Spill an evicted L1 entry to disk. Must be fast and non-throwing. */
-  save(key: string, entry: DiskCacheEntry): void {
+  /**
+   * Spill an evicted L1 entry to disk.
+   *
+   * Returns a Promise that resolves when the file is durably written. Callers
+   * that treat the spill as fire-and-forget should do:
+   *   `void disk.save(key, entry)`
+   *
+   * Implementation notes:
+   *  - pack() + AES-256-GCM encrypt run synchronously — both are pure CPU,
+   *    sub-millisecond for entries up to diskEntryMaxBytes, and do not block
+   *    on any external resource.
+   *  - The actual write syscall (mkdir + writeFile) is async via fs.promises,
+   *    so the Node.js event loop is never stalled waiting for disk I/O.
+   */
+  async save(key: string, entry: DiskCacheEntry): Promise<void> {
     if (this.isForbidden(key)) return;
     if (entry.expiresAt <= Date.now()) return;
 
@@ -124,6 +170,8 @@ export class DiskTier {
     this.ensureUsageCounted();
     if (this.diskUsageBytes >= this.opts.maxBytes) return; // disk cap hit
 
+    // ── Synchronous phase: pack + encrypt (CPU-only, no I/O) ─────────────
+    let final: Buffer;
     try {
       const payload: DiskPayload = {
         version: DISK_TIER_VERSION,
@@ -136,16 +184,24 @@ export class DiskTier {
         },
         writtenAt: Date.now(),
       };
-
       const packed = pack(payload);
       if (packed.length > this.opts.entryMaxBytes) return;
+      final = this.encrypt(packed);
+    } catch (err) {
+      this.opts.logger.debug('DiskTier: pack/encrypt failed', { key: key.slice(0, 50), error: (err as Error).message });
+      return;
+    }
 
-      const final    = this.encrypt(packed);
-      const filePath = this.keyToPath(key);
-      fs.writeFileSync(filePath, final, { mode: 0o600 });
-      this.diskUsageBytes += final.length;
+    // ── Async phase: mkdir + write (does not block the event loop) ────────
+    const filePath = this.keyToPath(key);
+    this.diskUsageBytes += final.length; // optimistic — rolled back on error
+
+    try {
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.promises.writeFile(filePath, final, { mode: 0o600 });
       this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
     } catch (err) {
+      this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
       this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
     }
   }
@@ -206,36 +262,32 @@ export class DiskTier {
     this.ensureDir();
     if (!this.dirReady) return 0;
     let purged = 0;
-    try {
-      const files = fs.readdirSync(this.opts.dir);
-      for (const filename of files) {
-        const filePath = path.join(this.opts.dir, filename);
-        try {
-          const stat = fs.statSync(filePath);
-          if (stat.size > this.opts.entryMaxBytes) {
-            fs.unlinkSync(filePath);
-            this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
-            purged++;
-            continue;
-          }
-          const raw = fs.readFileSync(filePath);
-          let dec: Buffer;
-          try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); purged++; continue; }
-          const payload = unpack(dec) as DiskPayload;
-          if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= Date.now()) {
-            fs.unlinkSync(filePath);
-            this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
-            purged++;
-          }
-        } catch { /* skip locked/gone */ }
-      }
-    } catch { /* dir gone */ }
+    for (const filePath of this.walkCacheFiles()) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size > this.opts.entryMaxBytes) {
+          fs.unlinkSync(filePath);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          purged++;
+          continue;
+        }
+        const raw = fs.readFileSync(filePath);
+        let dec: Buffer;
+        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); purged++; continue; }
+        const payload = unpack(dec) as DiskPayload;
+        if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= Date.now()) {
+          fs.unlinkSync(filePath);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          purged++;
+        }
+      } catch { /* skip locked/gone */ }
+    }
     return purged;
   }
 
   get stats(): { files: number; sizeKB: number; maxKB: number } {
     try {
-      const files = this.dirReady ? fs.readdirSync(this.opts.dir).length : 0;
+      const files = this.dirReady ? this.walkCacheFiles().length : 0;
       return { files, sizeKB: Math.round(this.diskUsageBytes / 1024), maxKB: Math.round(this.opts.maxBytes / 1024) };
     } catch {
       return { files: 0, sizeKB: 0, maxKB: Math.round(this.opts.maxBytes / 1024) };

@@ -75,6 +75,7 @@ export class CacheService {
   private readonly l1:         SmartMemoryCache;
   private readonly disk:       DiskTier;
   private readonly opts: {
+    namespace: string;
     logger: ILogger; l1MaxBytes: number; l1MaxEntries: number;
     categoryLimits: Record<string, CategoryLimit>;
     forbiddenSnapshotPrefixes: readonly string[];
@@ -95,19 +96,32 @@ export class CacheService {
     const logger = options.logger ?? consoleLogger;
     this.logger  = logger;
 
+    // Resolve namespace: trim whitespace, default to empty string
+    const ns = options.namespace?.trim() ?? '';
+
     // Resolve encryption key: option > env var
     const encKeyRaw = options.encryptionKey ?? process.env.CACHE_ENCRYPTION_KEY;
     this.enc = new CacheEncryption(encKeyRaw, logger);
 
+    // When a namespace is active, scope the forbidden prefixes so that
+    // auth/session keys like `org_abc:auth:token` are still protected.
+    const rawForbidden = options.forbiddenSnapshotPrefixes ?? [...DEFAULT_FORBIDDEN_PREFIXES];
+    const forbiddenPrefixes = ns
+      ? rawForbidden.map(p => `${ns}:${p}`)
+      : rawForbidden;
+
     // Normalised options with defaults
-    const forbiddenPrefixes = options.forbiddenSnapshotPrefixes ?? [...DEFAULT_FORBIDDEN_PREFIXES];
     this.opts = {
+      namespace:                ns,
       logger,
       l1MaxBytes:               options.l1MaxBytes   ?? 200 * 1024 * 1024,
       l1MaxEntries:             options.l1MaxEntries ?? 2_000,
       categoryLimits:           { ...DEFAULT_CATEGORY_LIMITS, ...(options.categoryLimits ?? {}) },
       forbiddenSnapshotPrefixes: forbiddenPrefixes,
-      diskCacheDir:             options.diskCacheDir    ?? path.join(os.tmpdir(), 'tricache-disk'),
+      // Namespace-isolated defaults: separate dir / snapshot per namespace so
+      // two instances with different namespaces never share cache files.
+      diskCacheDir:             options.diskCacheDir ?? path.join(
+        os.tmpdir(), ns ? `tricache-disk-${ns}` : 'tricache-disk'),
       diskMaxBytes:             options.diskMaxBytes    ?? 500 * 1024 * 1024,
       diskEntryMaxBytes:        options.diskEntryMaxBytes ?? 10 * 1024 * 1024,
       redisHost:                options.redisHost  ?? process.env.REDIS_HOST ?? '',
@@ -115,7 +129,8 @@ export class CacheService {
       redisTls:                 options.redisTls   ?? (process.env.NODE_ENV === 'production'),
       disableRedis:             options.disableRedis ?? (process.env.NODE_ENV !== 'production'),
       encryptionKey:            encKeyRaw,
-      snapshotPath:             options.snapshotPath    ?? path.join(os.tmpdir(), 'tricache-snapshot.msgpack'),
+      snapshotPath:             options.snapshotPath ?? path.join(
+        os.tmpdir(), ns ? `tricache-snapshot-${ns}.msgpack` : 'tricache-snapshot.msgpack'),
       snapshotMaxAgeMs:         options.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE,
     };
 
@@ -134,7 +149,7 @@ export class CacheService {
       maxBytes:   this.opts.l1MaxBytes,
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
-      diskSpill:  (key: string, entry: SmartCacheEntry) => this.disk.save(key, entry as unknown as DiskCacheEntry),
+      diskSpill:  (key: string, entry: SmartCacheEntry) => { void this.disk.save(key, entry as unknown as DiskCacheEntry); },
       logger,
     });
 
@@ -167,23 +182,45 @@ export class CacheService {
    *
    * Options are only applied on first call — subsequent calls return the
    * existing instance regardless of options passed.
+   *
+   * When `namespace` is set the singleton is keyed by namespace, so two calls
+   * with different namespaces return independent instances.
    */
   static create(options?: CacheOptions): CacheService {
-    const g = globalThis as Record<string, unknown>;
-    if (!g[GLOBAL_KEY]) g[GLOBAL_KEY] = new CacheService(options);
-    return g[GLOBAL_KEY] as CacheService;
+    const g   = globalThis as Record<string, unknown>;
+    const key = CacheService.globalKey(options);
+    if (!g[key]) g[key] = new CacheService(options);
+    return g[key] as CacheService;
   }
 
   /** Replace the singleton (useful in tests). */
   static reset(options?: CacheOptions): CacheService {
-    const g = globalThis as Record<string, unknown>;
-    const existing = g[GLOBAL_KEY] as CacheService | undefined;
+    const g   = globalThis as Record<string, unknown>;
+    const key = CacheService.globalKey(options);
+    const existing = g[key] as CacheService | undefined;
     if (existing) existing.destroy();
-    g[GLOBAL_KEY] = new CacheService(options);
-    return g[GLOBAL_KEY] as CacheService;
+    g[key] = new CacheService(options);
+    return g[key] as CacheService;
+  }
+
+  /** Derive the globalThis key for a given set of options. */
+  private static globalKey(options?: CacheOptions): string {
+    const ns = options?.namespace?.trim() ?? '';
+    return ns ? `__tricache_${ns}__` : GLOBAL_KEY;
   }
 
   // ── Redis connection ──────────────────────────────────────────────────────
+
+  /**
+   * Prepend the configured namespace to a raw cache key.
+   * Returns the key unchanged when namespace is empty.
+   *
+   * This is the only place the namespace prefix is applied — callers always
+   * receive and provide un-prefixed keys in the public API.
+   */
+  private nk(key: string): string {
+    return this.opts.namespace ? `${this.opts.namespace}:${key}` : key;
+  }
 
   private isRedisDisabled(): boolean {
     if (this.opts.disableRedis) return true;
@@ -325,14 +362,15 @@ export class CacheService {
   ): Promise<T> {
     const ttlMs        = ttlSeconds * 1_000;
     const swrGraceMs   = (opts.swr ?? 0) * 1_000;
-    const priority     = opts.priority ?? inferPriority(cacheKey);
+    const priority     = opts.priority ?? inferPriority(cacheKey); // original key for correct prefix inference
+    const k            = this.nk(cacheKey); // namespaced key used for all storage
 
     // L1: in-memory (fastest)
-    const l1Hit = this.l1.get(cacheKey);
+    const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
-      if (l1Hit.isStale && swrGraceMs > 0 && !this.revalidating.has(cacheKey)) {
-        this.revalidating.add(cacheKey);
-        void this._revalidate(cacheKey, fetchFn, ttlMs, swrGraceMs, priority);
+      if (l1Hit.isStale && swrGraceMs > 0 && !this.revalidating.has(k)) {
+        this.revalidating.add(k);
+        void this._revalidate(k, fetchFn, ttlMs, swrGraceMs, priority);
         this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
       } else {
         this.logger.debug('L1 hit', { cacheKey });
@@ -344,11 +382,11 @@ export class CacheService {
     if (!this.isRedisDisabled()) {
       try {
         const client = await this.getRedis();
-        const raw    = await client.get(cacheKey);
+        const raw    = await client.get(k);
         if (raw) {
           const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
           const parsed    = JSON.parse(decrypted) as T;
-          this.l1.set(cacheKey, parsed, ttlMs, { priority });
+          this.l1.set(k, parsed, ttlMs, { priority });
           this.logger.debug('L2 hit (Redis)', { cacheKey });
           return parsed;
         }
@@ -358,14 +396,14 @@ export class CacheService {
     }
 
     // L1.5: disk tier (evicted L1 entries)
-    const diskHit = this.disk.load(cacheKey);
+    const diskHit = this.disk.load(k);
     if (diskHit !== null) {
       const promoted = this.l1.importEntries(
-        [{ key: cacheKey, entry: diskHit as unknown as SmartCacheEntry }],
+        [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
         this.opts.forbiddenSnapshotPrefixes,
       );
       if (promoted > 0) {
-        const l1Check = this.l1.get(cacheKey);
+        const l1Check = this.l1.get(k);
         if (l1Check !== null) {
           this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
           return l1Check.value as T;
@@ -374,7 +412,7 @@ export class CacheService {
     }
 
     // Cache MISS: thundering-herd prevention
-    const existing = this.inflight.get(cacheKey);
+    const existing = this.inflight.get(k);
     if (existing) {
       this.logger.debug('Stampede prevented — coalescing onto inflight fetch', { cacheKey });
       return existing as Promise<T>;
@@ -386,14 +424,14 @@ export class CacheService {
         const staleAt  = swrGraceMs > 0 ? Date.now() + ttlMs : undefined;
         const storeTtl = swrGraceMs > 0 ? ttlMs + swrGraceMs : ttlMs;
 
-        this.l1.set(cacheKey, data, storeTtl, { priority, staleAt });
+        this.l1.set(k, data, storeTtl, { priority, staleAt });
 
         if (!this.isRedisDisabled()) {
           try {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
             const toStore    = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
-            await client.setex(cacheKey, ttlSeconds, toStore);
+            await client.setex(k, ttlSeconds, toStore);
             this.logger.debug('Cached L1+L2', { cacheKey, ttlSeconds, encrypted: this.enc.isEnabled });
           } catch {
             this.logger.debug('Cached L1 only (Redis unavailable)', { cacheKey });
@@ -404,11 +442,11 @@ export class CacheService {
 
         return data;
       } finally {
-        this.inflight.delete(cacheKey);
+        this.inflight.delete(k);
       }
     })();
 
-    this.inflight.set(cacheKey, fetchPromise);
+    this.inflight.set(k, fetchPromise);
     return fetchPromise;
   }
 
@@ -446,14 +484,15 @@ export class CacheService {
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority): Promise<void> {
     const ttlMs = ttlSeconds * 1_000;
     const p     = priority ?? inferPriority(cacheKey);
-    this.l1.set(cacheKey, data, ttlMs, { priority: p });
+    const k     = this.nk(cacheKey);
+    this.l1.set(k, data, ttlMs, { priority: p });
 
     if (!this.isRedisDisabled()) {
       try {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
         const stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
-        await client.setex(cacheKey, ttlSeconds, stored);
+        await client.setex(k, ttlSeconds, stored);
       } catch (err) {
         this.logger.debug('set: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
@@ -469,19 +508,20 @@ export class CacheService {
    */
   async delete(cacheKey: string): Promise<void> {
     const isPattern = cacheKey.includes('*');
+    const k         = this.nk(cacheKey); // namespace-scoped key / pattern
 
     if (isPattern) {
-      this.l1.deletePattern(cacheKey);
+      this.l1.deletePattern(k);
     } else {
-      this.l1.delete(cacheKey);
-      this.disk.delete(cacheKey);
+      this.l1.delete(k);
+      this.disk.delete(k);
     }
 
     if (!this.isRedisDisabled()) {
       try {
         const client = await this.getRedis();
         if (isPattern) {
-          const stream = client.scanStream({ match: cacheKey, count: 100 });
+          const stream = client.scanStream({ match: k, count: 100 });
           const keys: string[] = [];
           await new Promise<void>((resolve, reject) => {
             stream.on('data',  (chunk: string[]) => keys.push(...chunk));
@@ -490,7 +530,7 @@ export class CacheService {
           });
           if (keys.length > 0) await client.del(...keys);
         } else {
-          await client.del(cacheKey);
+          await client.del(k);
         }
       } catch (err) {
         this.logger.debug('delete: Redis unavailable', { cacheKey, error: (err as Error).message });
@@ -506,10 +546,11 @@ export class CacheService {
    */
   async increment(cacheKey: string, ttlSeconds?: number): Promise<number> {
     if (this.isRedisDisabled()) return 0;
+    const k = this.nk(cacheKey);
     try {
       const client = await this.getRedis();
-      const count  = await client.incr(cacheKey);
-      if (count === 1 && ttlSeconds) await client.expire(cacheKey, ttlSeconds);
+      const count  = await client.incr(k);
+      if (count === 1 && ttlSeconds) await client.expire(k, ttlSeconds);
       return count;
     } catch (err) {
       this.logger.error('increment: Redis error', { cacheKey }, err as Error);

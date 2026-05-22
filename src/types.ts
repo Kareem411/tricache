@@ -152,6 +152,30 @@ export interface CacheOptions {
    * on startup. Default: os.tmpdir()/tricache-snapshot.msgpack
    */
   snapshotPath?: string;
-  /** Max age (ms) of a snapshot file before it is rejected. Default: 2 hours */
+  /**
+   * Max age (ms) of a snapshot file before it is rejected. Default: 2 hours
+   */
   snapshotMaxAgeMs?: number;
+
+  /**
+   * Optional namespace prefix for all cache keys.
+   *
+   * When set, every key is transparently stored as `${namespace}:${key}` in
+   * L1, L1.5 (disk), and L2 (Redis). This enables:
+   *  - **Multi-tenant isolation**: `CacheService.create({ namespace: 'org_abc' })`
+   *    — tenants sharing the same Redis instance or disk dir are fully isolated.
+   *  - **Environment separation**: `CacheService.create({ namespace: 'staging' })`
+   *  - **Service-level scoping**: microservices sharing one Redis without key collisions.
+   *
+   * Consumers never see the prefix — `get('user:1')` behaves identically
+   * whether namespaced or not. Glob deletes (`delete('user:*')`) automatically
+   * scope to the namespace.
+   *
+   * The process-level singleton, disk cache directory, and cold-start snapshot
+   * path are all scoped per namespace, so two `CacheService.create()` calls
+   * with different namespaces return completely independent instances.
+   *
+   * Default: `''` (no prefix)
+   */
+  namespace?: string;
 }

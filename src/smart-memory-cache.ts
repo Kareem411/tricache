@@ -92,7 +92,7 @@ export interface SmartMemoryCacheOptions {
   maxBytes:    number;
   maxEntries:  number;
   categories:  Record<string, CategoryLimit>;
-  diskSpill?:  (key: string, entry: SmartCacheEntry) => void;
+  diskSpill?:  (key: string, entry: SmartCacheEntry) => void | Promise<void>;
   logger:      ILogger;
 }
 
