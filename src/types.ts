@@ -73,6 +73,85 @@ export interface DiskCacheEntry {
   priority: number;
 }
 
+// ─── Metrics snapshot ────────────────────────────────────────────────────────
+
+/**
+ * Snapshot of runtime metrics for a CacheService instance.
+ * Returned by `CacheService.metrics()` and passed to the `onMetrics` callback.
+ * Convert to Prometheus text with `CacheService.toPrometheusText(metrics)`.
+ */
+export interface CacheMetrics {
+  /** Configured namespace (empty string = no namespace) */
+  namespace: string;
+  /** Milliseconds since the CacheService instance was constructed */
+  uptimeMs:  number;
+
+  gets: {
+    total:             number;
+    l1Hits:            number;
+    /** Fraction of gets served from L1 RAM cache (0–1) */
+    l1HitRate:         number;
+    diskHits:          number;
+    /** Fraction of gets served from L1.5 disk tier (0–1) */
+    diskHitRate:       number;
+    l2Hits:            number;
+    /** Fraction of gets served from L2 Redis (0–1) */
+    l2HitRate:         number;
+    /** fetchFn calls (cache misses that fell through to the DB) */
+    fetches:           number;
+    /** Fraction of gets that called fetchFn (0–1) */
+    fetchRate:         number;
+    /** Concurrent get() calls deduplicated by the stampede guard */
+    stampedePrevented: number;
+  };
+
+  sets:          { total: number };
+  deletes:       { total: number };
+  revalidations: { total: number };
+
+  bloom: {
+    /** Total bloom-filter checks (get() calls that passed prefix filter) */
+    checksTotal:       number;
+    /**
+     * Times the filter said "might contain" but the key was absent in L1.
+     * A high rate suggests the bloom filter capacity needs increasing.
+     */
+    falsePositives:    number;
+    /** falsePositives / checksTotal (0–1; ideal < 0.01) */
+    falsePositiveRate: number;
+  };
+
+  compression: {
+    entriesCompressed:   number;
+    entriesUncompressed: number;
+    /** Approximate bytes saved by msgpackr vs raw JSON */
+    bytesSaved:          number;
+  };
+
+  /** Pub/Sub invalidation backplane statistics */
+  backplane: {
+    enabled:  boolean;
+    /** Invalidation messages published to other instances */
+    sent:     number;
+    /** Invalidation messages received from other instances */
+    received: number;
+    /** Own messages silently skipped (prevents double-eviction) */
+    skipped:  number;
+  };
+
+  /** OOM guard statistics */
+  oom: {
+    enabled:         boolean;
+    /** Number of emergency L1 eviction rounds triggered */
+    evictions:       number;
+    /** Timestamp of the most recent OOM eviction, or null */
+    lastTriggeredAt: number | null;
+  };
+
+  l1:   { entries: number; sizeBytes: number; maxBytes: number };
+  disk: { files: number; sizeKB: number; maxKB: number };
+}
+
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 /** Per-category memory limits for L1 */
@@ -178,4 +257,49 @@ export interface CacheOptions {
    * Default: `''` (no prefix)
    */
   namespace?: string;
+
+  // ── Invalidation backplane (Redis Pub/Sub) ──────────────────────────────
+  /**
+   * Enable Redis Pub/Sub invalidation backplane so every running instance
+   * evicts a key from its L1 when any peer calls `set()` or `delete()`.
+   *
+   * Gives you sub-microsecond in-process cache speed with cluster-wide
+   * consistency across all your app servers.
+   *
+   * Default: `true` (auto-activates when Redis is available).
+   * Set to `false` for single-process services or eventual-consistency scenarios.
+   */
+  invalidationBackplane?: boolean;
+
+  // ── OOM protection ──────────────────────────────────────────────────────
+  /**
+   * Enable the GC-aware OOM guard. When heap utilisation crosses
+   * `oomHeapThreshold`, a fraction of the coldest L1 entries are
+   * emergency-evicted to L1.5 disk, preventing Node.js OOM crashes inside
+   * Docker/Kubernetes containers with tight memory limits.
+   *
+   * Default: `true`
+   */
+  oomProtection?: boolean;
+  /**
+   * Heap-used / heap-total ratio that triggers emergency eviction.
+   * Default: `0.85` (85 %)
+   */
+  oomHeapThreshold?: number;
+  /** Milliseconds between heap-pressure checks. Default: 10 000 ms (10 s) */
+  oomCheckIntervalMs?: number;
+  /** Fraction of L1 entries to evict per OOM round. Default: `0.20` (20 %) */
+  oomEvictPercent?: number;
+
+  // ── Metrics / observability ─────────────────────────────────────────────
+  /**
+   * Callback invoked periodically with a `CacheMetrics` snapshot.
+   * Wire up to OpenTelemetry, Prometheus push gateway, Datadog, etc.
+   *
+   * @example
+   * onMetrics: (m) => statsd.gauge('cache.l1_hit_rate', m.gets.l1HitRate)
+   */
+  onMetrics?: (metrics: CacheMetrics) => void;
+  /** How often the `onMetrics` callback fires (ms). Default: 60 000 ms */
+  metricsIntervalMs?: number;
 }

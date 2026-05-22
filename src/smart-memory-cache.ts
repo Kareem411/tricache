@@ -104,6 +104,13 @@ export class SmartMemoryCache {
   private categoryCount     = new Map<string, number>();
   private categorySize      = new Map<string, number>();
 
+  // ── Observability counters ──────────────────────────────────────────────────────
+  private bloomChecks           = 0;
+  private bloomFalsePos         = 0;
+  private compressions          = 0;
+  private uncompressedEntries   = 0;
+  private compressionBytesSaved = 0;
+
   constructor(opts: SmartMemoryCacheOptions, existing?: Map<string, SmartCacheEntry>) {
     this.opts  = opts;
     this.bloom = createBloomFilter(opts.logger);
@@ -194,9 +201,10 @@ export class SmartMemoryCache {
   // ── Public API ────────────────────────────────────────────────────────────
 
   get(key: string): CacheHit | null {
+    this.bloomChecks++;
     if (!this.bloom.mightContain(key)) return null;
     const entry = this.cache.get(key);
-    if (!entry) return null;
+    if (!entry) { this.bloomFalsePos++; return null; }
     if (entry.expiresAt < Date.now()) { this._delete(key); return null; }
     entry.hits++;
     entry.lastAccess = Date.now();
@@ -224,10 +232,13 @@ export class SmartMemoryCache {
       size          = Buffer.byteLength(packed);
       entryData     = packed;
       isCompressed  = true;
+      this.compressions++;
+      this.compressionBytesSaved += Math.max(0, estimatedBytes - size);
     } else {
       size         = estimatedBytes;
       entryData    = jsonStr;
       isCompressed = false;
+      this.uncompressedEntries++;
     }
 
     const cat = this.getCategory(key);
@@ -260,6 +271,34 @@ export class SmartMemoryCache {
     let n = 0;
     for (const key of this.keysMatchingPattern(pattern)) if (this._delete(key)) n++;
     return n;
+  }
+
+  /**
+   * Forcibly evict the coldest `pct` fraction of non-CRITICAL L1 entries,
+   * spilling each to L1.5 disk. Called by the OOM guard when heap pressure
+   * exceeds the configured threshold.
+   *
+   * @param pct - Fraction to evict (0–1), e.g. 0.2 = 20 %
+   * @returns   Number of entries evicted
+   */
+  evictPercentage(pct: number): number {
+    if (pct <= 0 || this.cache.size === 0) return 0;
+    const now = Date.now();
+    const candidates: Array<{ key: string; score: number }> = [];
+    for (const [key, entry] of this.cache) {
+      if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
+      candidates.push({ key, score: this.score(entry, 0, now) });
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    const count = Math.max(1, Math.ceil(candidates.length * pct));
+    let evicted = 0;
+    for (const { key } of candidates.slice(0, count)) {
+      const entry = this.cache.get(key);
+      if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry);
+      this._delete(key);
+      evicted++;
+    }
+    return evicted;
   }
 
   cleanup(): number {
@@ -310,7 +349,20 @@ export class SmartMemoryCache {
   getStats() {
     const categories: Record<string, number> = {};
     for (const [cat, cnt] of this.categoryCount) categories[cat] = cnt;
-    return { entries: this.cache.size, sizeKB: Math.round(this.totalSize / 1024), categories };
+    return {
+      entries:  this.cache.size,
+      sizeKB:   Math.round(this.totalSize / 1024),
+      categories,
+      bloom: {
+        checks:         this.bloomChecks,
+        falsePositives: this.bloomFalsePos,
+      },
+      compression: {
+        compressed:   this.compressions,
+        uncompressed: this.uncompressedEntries,
+        bytesSaved:   this.compressionBytesSaved,
+      },
+    };
   }
 
   bloomMightContain(key: string): boolean { return this.bloom.mightContain(key); }

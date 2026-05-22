@@ -131,3 +131,129 @@ describe('Priority auto-inference', () => {
     expect(r).toBe('token');
   });
 });
+
+// ── Feature: metrics() ───────────────────────────────────────────────────────
+
+describe('CacheService.metrics()', () => {
+  it('tracks gets, l1Hits, fetches, and computes hit rates', async () => {
+    let calls = 0;
+    const fetch = () => { calls++; return Promise.resolve({ v: calls }); };
+
+    await svc.get('m:1', fetch, 60);   // cold miss → fetch #1
+    await svc.get('m:1', fetch, 60);   // warm hit
+    await svc.get('m:2', fetch, 60);   // cold miss → fetch #2
+
+    const m = svc.metrics();
+    expect(m.gets.total).toBe(3);
+    expect(m.gets.l1Hits).toBe(1);
+    expect(m.gets.fetches).toBe(2);
+    expect(m.gets.l1HitRate).toBeCloseTo(1 / 3, 5);
+    expect(m.gets.fetchRate).toBeCloseTo(2 / 3, 5);
+  });
+
+  it('tracks sets and deletes', async () => {
+    await svc.set('met:a', 1, 60);
+    await svc.set('met:b', 2, 60);
+    await svc.delete('met:a');
+
+    const m = svc.metrics();
+    expect(m.sets.total).toBe(2);
+    expect(m.deletes.total).toBe(1);
+  });
+
+  it('returns zero hit rates when no gets have been made', () => {
+    const m = svc.metrics();
+    expect(m.gets.total).toBe(0);
+    expect(m.gets.l1HitRate).toBe(0);
+    expect(m.gets.fetchRate).toBe(0);
+    expect(m.bloom.falsePositiveRate).toBe(0);
+  });
+
+  it('reports correct namespace and l1 size', async () => {
+    await svc.set('ns:x', { payload: 'data' }, 60);
+    const m = svc.metrics();
+    expect(m.namespace).toBe('');
+    expect(m.l1.entries).toBeGreaterThan(0);
+    expect(m.l1.maxBytes).toBeGreaterThan(0);
+    expect(m.uptimeMs).toBeGreaterThan(0);
+  });
+
+  it('toPrometheusText() produces valid HELP/TYPE/metric triples', async () => {
+    await svc.set('prom:1', 'v', 60);
+    const text = CacheService.toPrometheusText(svc.metrics());
+    // Every metric block should have HELP + TYPE + value lines
+    const helps = text.split('\n').filter(l => l.startsWith('# HELP'));
+    const types = text.split('\n').filter(l => l.startsWith('# TYPE'));
+    expect(helps.length).toBeGreaterThan(5);
+    expect(helps.length).toBe(types.length);
+    // Should contain known counters
+    expect(text).toContain('tricache_gets_total');
+    expect(text).toContain('tricache_l1_hit_rate');
+  });
+
+  it('toPrometheusText() includes namespace label when set', async () => {
+    const nsSvc = CacheService.reset({
+      disableRedis: true,
+      namespace:    'myapp',
+      diskCacheDir: tempDir(),
+    });
+    try {
+      await nsSvc.set('k', 1, 60);
+      const text = CacheService.toPrometheusText(nsSvc.metrics());
+      expect(text).toContain('{namespace="myapp"}');
+    } finally {
+      await nsSvc.destroy();
+    }
+  });
+});
+
+// ── Feature: OOM guard ───────────────────────────────────────────────────────
+
+describe('OOM guard', () => {
+  it('triggers eviction when heap threshold is set to near-zero', async () => {
+    const oomSvc = CacheService.reset({
+      disableRedis:       true,
+      oomProtection:      true,
+      oomHeapThreshold:   0.001, // always exceeded — forces eviction
+      oomCheckIntervalMs: 30,
+      oomEvictPercent:    0.5,
+      l1MaxBytes:         1_000_000,
+      l1MaxEntries:       200,
+      diskCacheDir:       tempDir(),
+    });
+    try {
+      for (let i = 0; i < 5; i++) await oomSvc.set(`oom:${i}`, { i }, 300);
+
+      // Wait for at least two OOM check intervals
+      await new Promise(r => setTimeout(r, 120));
+
+      const m = oomSvc.metrics();
+      expect(m.oom.enabled).toBe(true);
+      expect(m.oom.evictions).toBeGreaterThan(0);
+      expect(m.oom.lastTriggeredAt).not.toBeNull();
+    } finally {
+      await oomSvc.destroy();
+    }
+  });
+
+  it('does NOT evict when heap is below threshold', async () => {
+    const safeSvc = CacheService.reset({
+      disableRedis:       true,
+      oomProtection:      true,
+      oomHeapThreshold:   1.0, // impossible to exceed (> 100% heap)
+      oomCheckIntervalMs: 30,
+      oomEvictPercent:    0.5,
+      diskCacheDir:       tempDir(),
+    });
+    try {
+      await safeSvc.set('safe:1', 'x', 300);
+      await new Promise(r => setTimeout(r, 100));
+
+      const m = safeSvc.metrics();
+      expect(m.oom.evictions).toBe(0);
+      expect(m.oom.lastTriggeredAt).toBeNull();
+    } finally {
+      await safeSvc.destroy();
+    }
+  });
+});

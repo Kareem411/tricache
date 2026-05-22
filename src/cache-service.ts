@@ -17,6 +17,7 @@
  */
 
 import { Redis as RedisClient } from 'ioredis';
+import crypto from 'crypto';
 import os    from 'os';
 import fs    from 'fs';
 import path  from 'path';
@@ -28,6 +29,7 @@ import {
   SmartCacheEntry,
   DiskCacheEntry,
   CacheOptions,
+  CacheMetrics,
   ILogger,
   consoleLogger,
 } from './types';
@@ -82,6 +84,11 @@ export class CacheService {
     diskCacheDir: string; diskMaxBytes: number; diskEntryMaxBytes: number;
     redisHost: string; redisPort: number; redisTls: boolean; disableRedis: boolean;
     encryptionKey: string | undefined; snapshotPath: string; snapshotMaxAgeMs: number;
+    invalidationBackplane: boolean;
+    oomProtection: boolean; oomHeapThreshold: number;
+    oomCheckIntervalMs: number; oomEvictPercent: number;
+    onMetrics: ((m: CacheMetrics) => void) | undefined;
+    metricsIntervalMs: number;
   };
   private readonly inflight    = new Map<string, Promise<unknown>>();
   private readonly revalidating = new Set<string>();
@@ -89,6 +96,28 @@ export class CacheService {
   private redisConnecting:     Promise<RedisClient> | null = null;
   private snapshotLoaded       = false;
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
+  private oomInterval:         ReturnType<typeof setInterval> | null = null;
+  private metricsInterval:     ReturnType<typeof setInterval> | null = null;
+  private readonly instanceId:       string;
+  private readonly backplaneChannel: string;
+  private subClient:           RedisClient | null = null;
+  private readonly counters = {
+    gets:             0,
+    l1Hits:           0,
+    diskHits:         0,
+    l2Hits:           0,
+    fetches:          0,
+    stampedes:        0,
+    sets:             0,
+    deletes:          0,
+    swrRevalidations: 0,
+    invSent:          0,
+    invReceived:      0,
+    invSkipped:       0,
+    oomEvictions:     0,
+    oomLastAt:        null as number | null,
+    startedAt:        Date.now(),
+  };
 
   // ── Constructor (use CacheService.create() for the recommended singleton) ──
 
@@ -132,6 +161,13 @@ export class CacheService {
       snapshotPath:             options.snapshotPath ?? path.join(
         os.tmpdir(), ns ? `tricache-snapshot-${ns}.msgpack` : 'tricache-snapshot.msgpack'),
       snapshotMaxAgeMs:         options.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE,
+      invalidationBackplane:    options.invalidationBackplane ?? true,
+      oomProtection:            options.oomProtection      ?? true,
+      oomHeapThreshold:         options.oomHeapThreshold   ?? 0.85,
+      oomCheckIntervalMs:       options.oomCheckIntervalMs ?? 10_000,
+      oomEvictPercent:          options.oomEvictPercent    ?? 0.20,
+      onMetrics:                options.onMetrics,
+      metricsIntervalMs:        options.metricsIntervalMs  ?? 60_000,
     };
 
     // L1.5 disk tier
@@ -173,6 +209,38 @@ export class CacheService {
       }
     }, 5 * 60 * 1000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref(); // don't block process exit
+
+    // OOM protection: evict coldest L1 entries when heap pressure rises
+    if (this.opts.oomProtection) {
+      this.oomInterval = setInterval(() => {
+        const mem  = process.memoryUsage();
+        const used = mem.heapUsed / mem.heapTotal;
+        if (used >= this.opts.oomHeapThreshold) {
+          const evicted = this.l1.evictPercentage(this.opts.oomEvictPercent);
+          this.counters.oomEvictions++;
+          this.counters.oomLastAt = Date.now();
+          this.logger.warn('tricache OOM guard: emergency L1 eviction', {
+            heapUsedPct: Math.round(used * 100),
+            threshold:   Math.round(this.opts.oomHeapThreshold * 100),
+            evicted,
+          });
+        }
+      }, this.opts.oomCheckIntervalMs);
+      if (this.oomInterval.unref) this.oomInterval.unref();
+    }
+
+    // Metrics callback
+    if (this.opts.onMetrics && this.opts.metricsIntervalMs > 0) {
+      this.metricsInterval = setInterval(() => {
+        try { this.opts.onMetrics!(this.metrics()); } catch { /* never crash process */ }
+      }, this.opts.metricsIntervalMs);
+      if (this.metricsInterval.unref) this.metricsInterval.unref();
+    }
+
+    // Backplane: assign instance ID + channel, then subscribe
+    this.instanceId       = crypto.randomBytes(8).toString('hex');
+    this.backplaneChannel = `tricache:inv${ns ? ':' + ns : ''}`;
+    this.initBackplane();
   }
 
   // ── Singleton factory ─────────────────────────────────────────────────────
@@ -226,6 +294,68 @@ export class CacheService {
     if (this.opts.disableRedis) return true;
     if (!this.opts.redisHost)   return true;
     return false;
+  }
+
+  private initBackplane(): void {
+    if (!this.opts.invalidationBackplane || this.isRedisDisabled()) return;
+    if (this.subClient) return;
+
+    const sub = new RedisClient({
+      host:                 this.opts.redisHost,
+      port:                 this.opts.redisPort,
+      tls:                  this.opts.redisTls ? {} : undefined,
+      connectTimeout:       10_000,
+      lazyConnect:          true,
+      maxRetriesPerRequest: null as unknown as number,
+      enableAutoPipelining: false,
+      family:               4,
+      retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
+    });
+
+    sub.on('error', (e: Error) =>
+      this.logger.debug('Backplane subscriber error', { error: e.message }));
+
+    sub.on('message', (_channel: string, message: string) => {
+      try {
+        const msg = JSON.parse(message) as { op: 'del' | 'del-glob'; key: string; src: string };
+        if (msg.src === this.instanceId) {
+          this.counters.invSkipped++;
+          return; // own message — our L1 is already current
+        }
+        this.counters.invReceived++;
+        if (msg.op === 'del') {
+          this.l1.delete(msg.key);
+          this.disk.delete(msg.key);
+        } else if (msg.op === 'del-glob') {
+          this.l1.deletePattern(msg.key);
+        }
+        this.logger.debug('Backplane: peer invalidation applied', {
+          op: msg.op, key: msg.key.slice(0, 60),
+        });
+      } catch { /* malformed message — ignore */ }
+    });
+
+    sub.subscribe(this.backplaneChannel)
+      .then(() => this.logger.info('Backplane: subscribed', {
+        channel: this.backplaneChannel, instanceId: this.instanceId,
+      }))
+      .catch((err: Error) => this.logger.warn('Backplane: subscribe failed', {
+        error: err.message,
+      }));
+
+    this.subClient = sub;
+  }
+
+  private async publishInvalidation(op: 'del' | 'del-glob', key: string): Promise<void> {
+    if (!this.opts.invalidationBackplane || this.isRedisDisabled()) return;
+    try {
+      const client = await this.getRedis();
+      await client.publish(
+        this.backplaneChannel,
+        JSON.stringify({ op, key, src: this.instanceId }),
+      );
+      this.counters.invSent++;
+    } catch { /* non-critical — never block the caller */ }
   }
 
   private async getRedis(): Promise<RedisClient> {
@@ -364,6 +494,7 @@ export class CacheService {
     const swrGraceMs   = (opts.swr ?? 0) * 1_000;
     const priority     = opts.priority ?? inferPriority(cacheKey); // original key for correct prefix inference
     const k            = this.nk(cacheKey); // namespaced key used for all storage
+    this.counters.gets++;
 
     // L1: in-memory (fastest)
     const l1Hit = this.l1.get(k);
@@ -371,10 +502,12 @@ export class CacheService {
       if (l1Hit.isStale && swrGraceMs > 0 && !this.revalidating.has(k)) {
         this.revalidating.add(k);
         void this._revalidate(k, fetchFn, ttlMs, swrGraceMs, priority);
+        this.counters.swrRevalidations++;
         this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
       } else {
         this.logger.debug('L1 hit', { cacheKey });
       }
+      this.counters.l1Hits++;
       return l1Hit.value as T;
     }
 
@@ -387,6 +520,7 @@ export class CacheService {
           const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
           const parsed    = JSON.parse(decrypted) as T;
           this.l1.set(k, parsed, ttlMs, { priority });
+          this.counters.l2Hits++;
           this.logger.debug('L2 hit (Redis)', { cacheKey });
           return parsed;
         }
@@ -405,6 +539,7 @@ export class CacheService {
       if (promoted > 0) {
         const l1Check = this.l1.get(k);
         if (l1Check !== null) {
+          this.counters.diskHits++;
           this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
           return l1Check.value as T;
         }
@@ -414,12 +549,14 @@ export class CacheService {
     // Cache MISS: thundering-herd prevention
     const existing = this.inflight.get(k);
     if (existing) {
+      this.counters.stampedes++;
       this.logger.debug('Stampede prevented — coalescing onto inflight fetch', { cacheKey });
       return existing as Promise<T>;
     }
 
     const fetchPromise: Promise<T> = (async () => {
       try {
+        this.counters.fetches++;
         const data     = await fetchFn();
         const staleAt  = swrGraceMs > 0 ? Date.now() + ttlMs : undefined;
         const storeTtl = swrGraceMs > 0 ? ttlMs + swrGraceMs : ttlMs;
@@ -485,6 +622,7 @@ export class CacheService {
     const ttlMs = ttlSeconds * 1_000;
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
+    this.counters.sets++;
     this.l1.set(k, data, ttlMs, { priority: p });
 
     if (!this.isRedisDisabled()) {
@@ -497,6 +635,8 @@ export class CacheService {
         this.logger.debug('set: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
     }
+
+    void this.publishInvalidation('del', k);
   }
 
   /**
@@ -509,6 +649,7 @@ export class CacheService {
   async delete(cacheKey: string): Promise<void> {
     const isPattern = cacheKey.includes('*');
     const k         = this.nk(cacheKey); // namespace-scoped key / pattern
+    this.counters.deletes++;
 
     if (isPattern) {
       this.l1.deletePattern(k);
@@ -536,6 +677,8 @@ export class CacheService {
         this.logger.debug('delete: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
     }
+
+    void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k);
   }
 
   // ── Counter (distributed rate limiting) ──────────────────────────────────
@@ -567,11 +710,138 @@ export class CacheService {
     };
   }
 
+  // ── Observability ──────────────────────────────────────────────────────────────────
+
+  /** Return a full metrics snapshot. */
+  metrics(): CacheMetrics {
+    const c   = this.counters;
+    const l1s = this.l1.getStats();
+    const div = (n: number, d: number) => (d > 0 ? n / d : 0);
+
+    return {
+      namespace: this.opts.namespace,
+      uptimeMs:  Date.now() - c.startedAt,
+
+      gets: {
+        total:             c.gets,
+        l1Hits:            c.l1Hits,
+        l1HitRate:         div(c.l1Hits,  c.gets),
+        diskHits:          c.diskHits,
+        diskHitRate:       div(c.diskHits, c.gets),
+        l2Hits:            c.l2Hits,
+        l2HitRate:         div(c.l2Hits,  c.gets),
+        fetches:           c.fetches,
+        fetchRate:         div(c.fetches,  c.gets),
+        stampedePrevented: c.stampedes,
+      },
+
+      sets:          { total: c.sets },
+      deletes:       { total: c.deletes },
+      revalidations: { total: c.swrRevalidations },
+
+      bloom: {
+        checksTotal:       l1s.bloom.checks,
+        falsePositives:    l1s.bloom.falsePositives,
+        falsePositiveRate: div(l1s.bloom.falsePositives, l1s.bloom.checks),
+      },
+
+      compression: {
+        entriesCompressed:   l1s.compression.compressed,
+        entriesUncompressed: l1s.compression.uncompressed,
+        bytesSaved:          l1s.compression.bytesSaved,
+      },
+
+      backplane: {
+        enabled:  this.opts.invalidationBackplane && !this.isRedisDisabled(),
+        sent:     c.invSent,
+        received: c.invReceived,
+        skipped:  c.invSkipped,
+      },
+
+      oom: {
+        enabled:         this.opts.oomProtection,
+        evictions:       c.oomEvictions,
+        lastTriggeredAt: c.oomLastAt,
+      },
+
+      l1: {
+        entries:   l1s.entries,
+        sizeBytes: this.l1.memoryUsage,
+        maxBytes:  this.opts.l1MaxBytes,
+      },
+      disk: this.disk.stats,
+    };
+  }
+
+  /**
+   * Convert a `CacheMetrics` snapshot to Prometheus text exposition format.
+   * Paste the result into your `/metrics` endpoint.
+   *
+   * @param m      - Snapshot returned by `cache.metrics()`
+   * @param prefix - Metric name prefix. Default: `"tricache"`
+   */
+  static toPrometheusText(m: CacheMetrics, prefix = 'tricache'): string {
+    const lbl  = m.namespace ? `{namespace="${m.namespace}"}` : '';
+    const lines: string[] = [];
+
+    const counter = (name: string, val: number, help: string) => {
+      lines.push(`# HELP ${prefix}_${name}_total ${help}`);
+      lines.push(`# TYPE ${prefix}_${name}_total counter`);
+      lines.push(`${prefix}_${name}_total${lbl} ${val}`);
+    };
+    const gauge = (name: string, val: number, help: string) => {
+      lines.push(`# HELP ${prefix}_${name} ${help}`);
+      lines.push(`# TYPE ${prefix}_${name} gauge`);
+      lines.push(`${prefix}_${name}${lbl} ${val}`);
+    };
+
+    counter('gets',                m.gets.total,             'Total get() calls');
+    counter('l1_hits',             m.gets.l1Hits,            'L1 RAM cache hits');
+    counter('disk_hits',           m.gets.diskHits,          'L1.5 disk tier hits');
+    counter('l2_hits',             m.gets.l2Hits,            'L2 Redis hits');
+    counter('fetches',             m.gets.fetches,           'fetchFn calls (cache misses)');
+    counter('stampedes_prevented', m.gets.stampedePrevented, 'Coalesced duplicate inflight requests');
+    counter('sets',                m.sets.total,             'Total set() calls');
+    counter('deletes',             m.deletes.total,          'Total delete() calls');
+    counter('swr_revalidations',   m.revalidations.total,    'Stale-While-Revalidate background refreshes');
+
+    gauge('l1_hit_rate',   m.gets.l1HitRate,   'Fraction of gets served from L1 RAM (0-1)');
+    gauge('disk_hit_rate', m.gets.diskHitRate, 'Fraction of gets served from disk (0-1)');
+    gauge('l2_hit_rate',   m.gets.l2HitRate,   'Fraction of gets served from Redis (0-1)');
+    gauge('fetch_rate',    m.gets.fetchRate,   'Fraction of gets calling fetchFn (0-1)');
+
+    gauge('l1_entries',    m.l1.entries,   'Current L1 entry count');
+    gauge('l1_size_bytes', m.l1.sizeBytes, 'Current L1 used bytes');
+    gauge('disk_files',    m.disk.files,   'Current L1.5 disk file count');
+
+    gauge('bloom_false_positive_rate', m.bloom.falsePositiveRate,
+      'Bloom filter false-positive rate; increase capacity if > 0.01');
+    gauge('compression_bytes_saved', m.compression.bytesSaved,
+      'Approximate bytes saved by msgpackr compression');
+
+    if (m.backplane.enabled) {
+      counter('backplane_sent',     m.backplane.sent,     'Invalidation messages sent via Pub/Sub');
+      counter('backplane_received', m.backplane.received, 'Invalidation messages received from peers');
+    }
+    if (m.oom.enabled) {
+      counter('oom_evictions', m.oom.evictions,
+        'Emergency L1 eviction rounds triggered by heap pressure');
+    }
+
+    return lines.join('\n');
+  }
+
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
-  /** Close Redis connection and stop the cleanup timer. */
+  /** Close Redis connections and stop all background timers. */
   async destroy(): Promise<void> {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    if (this.oomInterval)     clearInterval(this.oomInterval);
+    if (this.metricsInterval) clearInterval(this.metricsInterval);
+    if (this.subClient) {
+      try { await this.subClient.quit(); } catch { /* ok */ }
+      this.subClient = null;
+    }
     if (this.redis) {
       try { await this.redis.disconnect(); } catch { /* ok */ }
       this.redis = null;

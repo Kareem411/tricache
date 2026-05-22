@@ -28,6 +28,7 @@ export {
   consoleLogger,
   type ILogger,
   type CacheOptions,
+  type CacheMetrics,
   type CategoryLimit,
   type SmartCacheEntry,
   type DiskCacheEntry,
