@@ -29,6 +29,11 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 | **Pub/sub invalidation backplane** | Redis pub/sub channel propagates deletes across all instances in real time |
 | **Tag-based invalidation** | Tag entries on write; `invalidateTag('catalog')` evicts all matching entries from L1, disk, and Redis atomically |
 | **Batch read** | `mget()` collects L1 hits, calls `fetchFn` only for misses, preserves ordering |
+| **Batch write** | `mset()` / `mdel()` write or delete many keys in a single `Promise.all` call |
+| **TTL jitter** | `ttlJitterFactor` spreads expirations across a configurable ± window — prevents thundering-cliff mass-expiry |
+| **OpenTelemetry spans** | Structural `ICacheTracer` / `ICacheSpan` interfaces — pass any OTEL-compatible tracer; no peer dep required |
+| **L2 circuit breaker** | Suspends Redis after N consecutive failures; auto-probes after cooldown; state visible in `metrics()` |
+| **`warmFromL2(pattern)`** | Scan Redis and pre-populate L1 at startup; returns count loaded; no-op when Redis unavailable |
 | **OOM guard** | Polls `heapUsed/heapTotal` on a timer; emergency-evicts coldest L1 entries before the process crashes |
 | **Cold-start snapshot** | L1 serialised to disk on `SIGTERM`/`SIGINT`, reloaded on next startup — warm cache, cold process |
 | **AES-256-GCM encryption** | L2 (Redis) values, disk spill files, and snapshots encrypted at rest; zero-downtime key rotation via `previousEncryptionKey` |
@@ -96,6 +101,19 @@ const [userA, userB] = await cache.mget(
   (missKeys) => db.users.findByIds(missKeys).then(rowsToMap),
   300,
 );
+
+// Batch write
+await cache.mset({
+  [`user:${userIdA}`]: { value: userA, ttl: 300 },
+  [`user:${userIdB}`]: { value: userB, ttl: 300 },
+});
+
+// Batch delete
+await cache.mdel([`user:${userIdA}`, `user:${userIdB}`]);
+
+// Warm L1 from Redis at startup
+const loaded = await cache.warmFromL2('user:*');
+console.log(`Pre-warmed ${loaded} user entries`);
 
 // Tag entries for group invalidation
 await cache.set(`product:${id}`, product, 300, undefined, { tags: ['catalog'] });
@@ -181,6 +199,24 @@ CacheService.create({
   // reason: 'capacity' | 'category' | 'rebalance' | 'oom' | 'ttl' | 'manual'
   onEviction: (key, reason) => metrics.increment(`cache.eviction.${reason}`),
 
+  // ── TTL jitter ────────────────────────────────────────────────────────
+  // Multiply each TTL by a random factor in [1-j, 1+j] to spread expiry.
+  // Prevents mass-expiry stampedes ("thundering cliff").
+  // Range [0, 1]; default 0 (no jitter).
+  ttlJitterFactor: 0.15,  // ± 15 % spread
+
+  // ── OpenTelemetry tracer ──────────────────────────────────────────────
+  // Pass any @opentelemetry/api-compatible tracer. No peer dependency.
+  // Spans: 'tricache.get' | 'tricache.set' | 'tricache.delete'
+  // Attributes: cache.key_prefix, cache.hit ('l1'|'disk'|'l2'|'miss')
+  tracer: trace.getTracer('my-app'),
+
+  // ── L2 circuit breaker ────────────────────────────────────────────────
+  // Opens after N consecutive Redis errors; probes after cooldown ms.
+  // State visible in cache.metrics().l2CircuitBreaker.state
+  l2CircuitBreakerThreshold:  5,      // default
+  l2CircuitBreakerCooldownMs: 30_000, // default
+
   // ── Prometheus instance label ─────────────────────────────────────────
   // Adds an `instance` label to every metric in toPrometheusText().
   instanceName: 'api-us-east-1',
@@ -260,6 +296,35 @@ const [userA, userB] = await cache.mget(
   (missKeys) => db.users.findByIds(missKeys).then(rowsToMap),
   300,
 );
+```
+
+### `cache.mset<T>(entries)` → `Promise<void>`
+
+Write multiple entries in a single call. Each entry accepts `value`, `ttl`, `priority`, and `tags`.
+
+```typescript
+await cache.mset({
+  'user:1': { value: alice, ttl: 300, priority: CachePriority.HIGH, tags: ['users'] },
+  'user:2': { value: bob,   ttl: 300 },
+});
+```
+
+### `cache.mdel(keys)` → `Promise<void>`
+
+Delete multiple keys in a single call. No-op for keys that do not exist.
+
+```typescript
+await cache.mdel(['user:1', 'user:2', 'user:3']);
+```
+
+### `cache.warmFromL2(pattern)` → `Promise<number>`
+
+Scan Redis for keys matching a glob pattern (e.g. `'user:*'`) and load their values into L1 with a 10-minute TTL. Returns the number of keys loaded. Returns `0` immediately when Redis is disabled or unreachable — safe to call unconditionally at startup.
+
+```typescript
+// In your application startup
+const loaded = await cache.warmFromL2('user:*');
+console.log(`Pre-warmed ${loaded} user entries from Redis`);
 ```
 
 ### `cache.has(key)` → `boolean`
@@ -547,35 +612,35 @@ Measured on a single Node.js thread (no `await` on synchronous paths):
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — hot hit (8K entries) | **2.19 M/s** | 457 ns | bloom → Map lookup → return cached value |
-| `get` — cold miss | **5.81 M/s** | 172 ns | bloom gates → early return |
-| `set` — tiny payload | 915 K/s | 1.09 µs | pack() + Map.set + bloom.add |
-| `set` — small payload (≈ 512 B) | 562 K/s | 1.78 µs | pack() same unified path, larger payload |
-| `set` — large payload (≥ 512 B) | 213.6 K/s | 4.68 µs | pack() larger payload |
-| `set` — CRITICAL priority | 489.7 K/s | 2.04 µs | same set path; skipped in eviction sort |
-| `delete` — exact key | **4.40 M/s** | 227 ns | Map.delete |
-| `deletePattern` — glob wildcard | 7.1 K/s | 141 µs | O(n) Map scan |
-| Count-Min Sketch estimate | **3.04 M/s** | 329 ns | 4 row lookups — called on every `get()` hit and `set()` |
+| `get` — hot hit (8K entries) | **2.60 M/s** | 385 ns | bloom → Map lookup → return cached value |
+| `get` — cold miss | **7.07 M/s** | 141 ns | bloom gates → early return |
+| `set` — tiny payload | 899 K/s | 1.11 µs | pack() + Map.set + bloom.add |
+| `set` — small payload (≈ 512 B) | 554 K/s | 1.81 µs | pack() same unified path, larger payload |
+| `set` — large payload (≥ 512 B) | 205.3 K/s | 4.87 µs | pack() larger payload |
+| `set` — CRITICAL priority | 730.1 K/s | 1.37 µs | same set path; skipped in eviction sort |
+| `delete` — exact key | **3.94 M/s** | 254 ns | Map.delete |
+| `deletePattern` — glob wildcard | 7.2 K/s | 138 µs | O(n) Map scan |
+| Count-Min Sketch estimate | **2.97 M/s** | 336 ns | 4 row lookups — called on every `get()` hit and `set()` |
 
 **Iterator interface (L1 live entries, 500 entries)**
 
 | Method | Throughput | Latency | Notes |
 |---|---|---|---|
-| `cache.keys()` | 34.5 K/s | 29 µs | no `[key,entry]` tuple allocation — +19 % vs v0.2.0 |
-| `cache.values()` | 35 K/s | 29 µs | `yield*` delegation — +4 % vs v0.2.0 |
-| `cache.entries()` | 28 K/s | 35 µs | `[strippedKey, value]` pairs |
-| raw `Map` iteration (baseline) | 338 K/s | 3 µs | no expiry check, no generator overhead |
+| `cache.keys()` | 34.1 K/s | 29 µs | no `[key,entry]` tuple allocation — +19 % vs v0.2.0 |
+| `cache.values()` | 33.6 K/s | 30 µs | `yield*` delegation — +4 % vs v0.2.0 |
+| `cache.entries()` | 24.5 K/s | 41 µs | `[strippedKey, value]` pairs |
+| raw `Map` iteration (baseline) | 351 K/s | 2.85 µs | no expiry check, no generator overhead |
 
 **CacheService (end-to-end)**
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — L1 warm hit | **2.16 M/s** | 462 ns | inflight check → l1.get → return cached value |
-| `get` — SWR stale serve | **2.04 M/s** | 491 ns | serves stale; revalidates async |
-| `get` — miss + fetchFn | 14.2 K/s | 70 µs | Promise microtask + l1.set |
-| `set` | 32.3 K/s | 30.93 µs | l1.set + disk.save (fire-and-forget) |
-| `delete` — exact key | 6.5 K/s | 154 µs | l1.delete + disk.delete + backplane |
-| `delete` — glob `*` | 781.5 K/s | 1.28 µs | l1.deletePattern O(n) + disk glob |
+| `get` — L1 warm hit | **1.86 M/s** | 539 ns | inflight check → l1.get → return cached value |
+| `get` — SWR stale serve | **796 K/s** | 1.26 µs | serves stale; revalidates async |
+| `get` — miss + fetchFn | 13.7 K/s | 73 µs | Promise microtask + l1.set |
+| `set` | 31.0 K/s | 32 µs | l1.set + disk.save (fire-and-forget) |
+| `delete` — exact key | 7.9 K/s | 126 µs | l1.delete + disk.delete + backplane |
+| `delete` — glob `*` | 687 K/s | 1.46 µs | l1.deletePattern O(n) + disk glob |
 
 **Encryption** (IV pool, pre-allocated output buffers)
 

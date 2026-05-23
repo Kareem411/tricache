@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-23
+
+### Added
+
+- **TTL jitter (`ttlJitterFactor`)** — Spread cache expirations across a configurable ± window to prevent synchronised stampedes when large numbers of entries expire simultaneously ("thundering cliff"). Setting `ttlJitterFactor: 0.15` multiplies each TTL by a random factor in `[0.85, 1.15]`. Clamped to `[0, 1]`; default `0` (no jitter). Applied in both `set()` and the populate path of `get()`.
+
+  ```typescript
+  CacheService.create({ ttlJitterFactor: 0.15 }); // ± 15 % TTL spread
+  ```
+
+- **Batch write operations — `mset()` / `mdel()`** — Write or delete many keys in a single call without hand-rolling `Promise.all`.
+
+  ```typescript
+  await cache.mset({
+    'user:1': { value: alice, ttl: 300, priority: CachePriority.HIGH },
+    'user:2': { value: bob,   ttl: 300 },
+  });
+  await cache.mdel(['user:1', 'user:2']);
+  ```
+
+- **Native OpenTelemetry span integration (`tracer` option)** — Pass any `@opentelemetry/api`-compatible tracer and tricache will emit spans for `get`, `set`, and `delete` operations. Structurally typed — no `@opentelemetry/api` peer dependency; works with any compliant tracer.
+
+  Span names: `tricache.get`, `tricache.set`, `tricache.delete`  
+  Attributes set: `cache.key_prefix` (first `:` segment), `cache.hit` (`'l1'` | `'disk'` | `'l2'` | `'miss'`)
+
+  ```typescript
+  import { trace } from '@opentelemetry/api';
+  CacheService.create({ tracer: trace.getTracer('my-app') });
+  ```
+
+  Two lightweight interfaces are exported for typing without an OTEL peer dep:
+
+  ```typescript
+  import type { ICacheTracer, ICacheSpan } from 'tricache';
+  ```
+
+- **L2 circuit breaker** — Automatically suspends Redis calls after `l2CircuitBreakerThreshold` consecutive failures (default 5) and resumes a probe after `l2CircuitBreakerCooldownMs` (default 30 000 ms). A successful probe resets to `CLOSED`; a failed probe re-opens immediately. State is exposed in `cache.metrics().l2CircuitBreaker.state` (`'closed'` | `'open'` | `'half_open'`).
+
+  ```typescript
+  CacheService.create({
+    l2CircuitBreakerThreshold:  3,     // open after 3 consecutive Redis errors
+    l2CircuitBreakerCooldownMs: 10_000, // probe again after 10 s
+  });
+  ```
+
+- **`warmFromL2(pattern)`** — Scan Redis for keys matching a glob pattern and pre-populate L1 before serving traffic. Returns the number of keys loaded. Returns `0` silently when Redis is disabled or unreachable, so it is safe to call unconditionally at startup.
+
+  ```typescript
+  const loaded = await cache.warmFromL2('user:*');
+  console.log(`Warmed ${loaded} user entries from Redis`);
+  ```
+
+---
+
 ## [0.3.0] — 2026-05-23
 
 ### Added
