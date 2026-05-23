@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-23
+
+### Added
+
+- **Negative caching (`notFoundTtl`)** — Prevent repeated upstream calls for keys that genuinely do not exist. When `fetchFn` returns `null` or `undefined`, the result is now cached for `notFoundTtl` seconds rather than bypassing the cache entirely. Configurable globally via `CacheOptions.notFoundTtl` and overridden per-call via `opts.notFoundTtl` in `cache.get()`.
+
+  ```typescript
+  // Global: cache all "not found" results for 30 s
+  CacheService.create({ notFoundTtl: 30 });
+
+  // Per-call override
+  const user = await cache.get('user:999', () => db.users.find(999), 300, { notFoundTtl: 10 });
+  ```
+
+- **`cache.setIfAbsent(key, value, ttlSeconds?)`** — Atomic "set if not cached". Checks L1 first; if absent, attempts a Redis `SET NX EX`; on success, populates L1. Returns `true` if the value was written, `false` if a live entry already existed. Zero-cost on the common "already cached" path — no Redis round-trip.
+
+  ```typescript
+  const written = await cache.setIfAbsent(`session:${id}`, sessionData, 3600);
+  if (!written) { /* session already exists — do not overwrite */ }
+  ```
+
+- **Refresh-ahead (`opts.refreshAhead`)** — Per-call opt on `cache.get()`. When the remaining TTL falls at or below `ttl × (1 - refreshAhead)`, a background recompute is triggered transparently — callers always receive the cached value with zero added latency. Complements SWR: refresh-ahead fires before the entry becomes stale; SWR fires after.
+
+  ```typescript
+  // Recompute in background when ≤ 20 % of TTL remains
+  const config = await cache.get('config:global', fetchConfig, 3600, { refreshAhead: 0.2 });
+  ```
+
+- **XFetch probabilistic early expiry (`opts.xfetchBeta`)** — Per-call opt on `cache.get()`. Implements the XFetch algorithm: recompute probability increases as expiry approaches and scales with last fetch duration, preventing thundering-herd spikes on expiry. Higher `xfetchBeta` values recompute earlier; `1.0` is the standard starting point.
+
+  ```typescript
+  // Probabilistic background recompute scaled to fetch duration
+  const feed = await cache.get('feed:home', fetchFeed, 600, { xfetchBeta: 1.0 });
+  ```
+
+- **`dependsOn` cascade invalidation (`opts.dependsOn` on `cache.set()`)** — Tag any entry with one or more parent keys. When a parent key is deleted (exact or glob), all dependents are automatically evicted from L1. No separate invalidation call needed.
+
+  ```typescript
+  await cache.set('org:42:members', members, 300, undefined, { dependsOn: ['org:42'] });
+  await cache.set('org:42:config',  config,  300, undefined, { dependsOn: ['org:42'] });
+  await cache.delete('org:42'); // also evicts org:42:members and org:42:config
+  ```
+
+- **`cache.hotKeys(n?)`** — Returns the top `n` (default 10) live L1 keys ranked by Count-Min Sketch access frequency, with entry size. Expired entries are excluded; namespace prefix is stripped. Useful for debugging cache hotspots, adaptive pre-warming, and capacity planning.
+
+  ```typescript
+  const hot = cache.hotKeys(5);
+  // [{ key: 'user:1', hits: 1024, sizeBytes: 512 }, ...]
+  ```
+
+### Performance
+
+- **Refresh-ahead/XFetch overhead eliminated** — Previously, the `refreshAhead`/`xfetchBeta` code path called `l1.get(k)` followed immediately by `l1.getEntry(k)` to read `expiresAt`, `ttlMs`, and `delta` — two full Map traversals plus three `Date.now()` calls on every warm L1 hit when either opt was active. The `CacheHit` interface now carries `expiresAt`, `ttlMs`, and `delta` directly, populated in `SmartMemoryCache.get()` from the entry already in hand. The `getEntry()` call is gone. Warm L1 hit overhead with `refreshAhead`/`xfetchBeta` opts drops from **+49 %** to **< 2 %** (one extra `Date.now()` + three arithmetic ops).
+
+---
+
 ## [0.3.1] — 2026-05-23
 
 ### Added

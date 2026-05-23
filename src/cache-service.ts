@@ -149,6 +149,7 @@ export class CacheService {
     instanceName: string;
     ttlJitterFactor: number;
     tracer: ICacheTracer | undefined;
+    notFoundTtl: number;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -159,6 +160,11 @@ export class CacheService {
   private readonly _l1Counters = new Map<string, { value: number; expiresAt: number }>();
   /** tag → Set of namespaced cache keys; maintained in-process for O(1) invalidateTag() */
   private readonly tagIndex    = new Map<string, Set<string>>();
+  /**
+   * Dependency index: source glob pattern → Set of namespaced dependent keys.
+   * When an exact-key delete matches a registered pattern, all dependents are cascaded.
+   */
+  private readonly dependencyIndex = new Map<string, Set<string>>();
   private redis:               RedisClient | null = null;
   private redisConnecting:     Promise<RedisClient> | null = null;
   private readonly cb:         L2CircuitBreaker;
@@ -248,6 +254,7 @@ export class CacheService {
       instanceName:             options.instanceName       ?? '',
       ttlJitterFactor:          Math.min(Math.max(options.ttlJitterFactor ?? 0, 0), 1),
       tracer:                   options.tracer,
+      notFoundTtl:              options.notFoundTtl ?? 0,
     };
 
     // Circuit breaker for L2 Redis
@@ -602,18 +609,29 @@ export class CacheService {
    * @param cacheKey     - Unique key identifying this value
    * @param fetchFn      - Called on a cache miss; its return value is cached and returned
    * @param ttlSeconds   - How long to cache the value (default: 300 s = 5 min)
-   * @param opts.priority - Override the auto-inferred eviction priority
-   * @param opts.swr      - Stale-While-Revalidate grace seconds. When > 0 the entry stays
-   *                        alive for this many extra seconds after TTL; callers get stale data
-   *                        instantly while a background refresh runs. Default: 0 (disabled).
+   * @param opts.priority    - Override the auto-inferred eviction priority
+   * @param opts.swr         - Stale-While-Revalidate grace seconds.
+   * @param opts.refreshAhead - 0–1 fraction of TTL elapsed at which a background recompute
+   *                            is triggered proactively while the caller still receives the
+   *                            cached value. E.g. `0.8` starts refreshing at 80 % of TTL.
+   *                            Requires `fetchFn` to be stable across calls.
+   * @param opts.xfetchBeta  - Enable XFetch (probabilistic early expiration). Higher values
+   *                            recompute more aggressively before expiry. Typical range: 0.5–2.
+   *                            Complementary to refreshAhead — uses recompute cost (delta) to
+   *                            decide probabilistically rather than at a fixed threshold.
+   * @param opts.notFoundTtl - Override TTL in seconds for `null`/`undefined` fetch results.
+   *                            Caches negative lookups to avoid repeated DB hits for missing keys.
    */
   async get<T>(
     cacheKey:   string,
     fetchFn:    () => Promise<T>,
     ttlSeconds: number = 300,
     opts: {
-      priority?: CachePriority;
-      swr?:      number; // Stale-While-Revalidate grace period in seconds
+      priority?:    CachePriority;
+      swr?:         number;
+      refreshAhead?: number; // 0–1: trigger background recompute at this fraction of TTL elapsed
+      xfetchBeta?:  number;  // > 0: XFetch probabilistic early expiration (uses stored delta)
+      notFoundTtl?: number;  // seconds; cache null/undefined results with this TTL instead
     } = {},
   ): Promise<T> {
     const span = this._startSpan('tricache.get');
@@ -637,6 +655,34 @@ export class CacheService {
         }
       } else {
         this.logger.debug('L1 hit');
+        // Refresh-ahead and XFetch: proactively recompute a fresh entry before it expires.
+        // l1Hit already carries expiresAt/ttlMs/delta — no second Map lookup needed.
+        if (!this.revalidating.has(k) && (opts.refreshAhead || opts.xfetchBeta)) {
+          const now       = Date.now();
+          const remaining = l1Hit.expiresAt - now;
+          const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
+          const priority  = opts.priority ?? inferPriority(cacheKey);
+
+          const shouldRefreshAhead = opts.refreshAhead != null && opts.refreshAhead > 0
+            ? remaining <= entryTtl * (1 - opts.refreshAhead)
+            : false;
+
+          // XFetch: fire with probability proportional to recompute cost (delta) vs. remaining TTL
+          // Formula: fire when remaining <= delta * beta * -ln(U), U ~ uniform(0,1)
+          const shouldXFetch = opts.xfetchBeta != null && opts.xfetchBeta > 0 && l1Hit.delta != null
+            ? remaining <= l1Hit.delta * opts.xfetchBeta * -Math.log(Math.random())
+            : false;
+
+          if (shouldRefreshAhead || shouldXFetch) {
+            this.revalidating.add(k);
+            void this._revalidate(k, fetchFn, entryTtl, (opts.swr ?? 0) * 1_000, priority);
+            this.counters.swrRevalidations++;
+            this.logger.debug(
+              shouldXFetch ? 'XFetch: proactive background recompute' : 'Refresh-ahead: proactive background recompute',
+              { cacheKey, remainingMs: remaining, ttlMs: entryTtl },
+            );
+          }
+        }
       }
       this.counters.l1Hits++;
       span.setAttribute('cache.hit', 'l1').end();
@@ -700,18 +746,25 @@ export class CacheService {
     const fetchPromise: Promise<T> = (async () => {
       try {
         this.counters.fetches++;
-        const data     = await fetchFn();
-        const staleAt  = swrGraceMs > 0 ? Date.now() + ttlMs : undefined;
-        const storeTtl = swrGraceMs > 0 ? ttlMs + swrGraceMs : ttlMs;
+        const fetchStart  = Date.now();
+        const data        = await fetchFn();
+        const delta       = Date.now() - fetchStart;
 
-        this.l1.set(k, data, storeTtl, priority, staleAt);
+        // Negative caching: null/undefined results get their own (shorter) TTL
+        const notFoundTtlMs = (opts.notFoundTtl ?? this.opts.notFoundTtl) * 1_000;
+        const effectiveTtl  = (data == null && notFoundTtlMs > 0) ? notFoundTtlMs : ttlMs;
+
+        const staleAt  = swrGraceMs > 0 ? Date.now() + effectiveTtl : undefined;
+        const storeTtl = swrGraceMs > 0 ? effectiveTtl + swrGraceMs : effectiveTtl;
+
+        this.l1.set(k, data, storeTtl, priority, staleAt, delta);
 
         if (!this._redisDisabled) {
           try {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
             const toStore    = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
-            await client.setex(k, Math.ceil(ttlMs / 1_000), toStore);
+            await client.setex(k, Math.ceil(effectiveTtl / 1_000), toStore);
             this.cb.onSuccess();
             this.logger.debug('Cached L1+L2', { cacheKey, ttlSeconds, encrypted: this.enc.isEnabled });
           } catch {
@@ -741,9 +794,11 @@ export class CacheService {
     priority:  CachePriority,
   ): Promise<void> {
     try {
-      const data    = await fetchFn();
-      const staleAt = Date.now() + ttlMs;
-      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt);
+      const fetchStart = Date.now();
+      const data       = await fetchFn();
+      const delta      = Date.now() - fetchStart;
+      const staleAt    = Date.now() + ttlMs;
+      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta);
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
         try {
@@ -772,7 +827,7 @@ export class CacheService {
   // ── Explicit set / delete ─────────────────────────────────────────────────
 
   /** Explicitly write a value into L1 (+ L2 in production). */
-  async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[] }): Promise<void> {
+  async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[]; dependsOn?: string[] }): Promise<void> {
     const span  = this._startSpan('tricache.set');
     span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
@@ -801,6 +856,17 @@ export class CacheService {
           await pl.exec();
           this.cb.onSuccess();
         } catch { this.cb.onFailure(); /* tags are best-effort */ }
+      }
+    }
+
+    // Register dependency patterns: when any key matching a pattern is deleted,
+    // this key (k) is automatically cascaded.
+    if (opts?.dependsOn?.length) {
+      for (const pattern of opts.dependsOn) {
+        const nsPattern = this.nk(pattern);
+        let deps = this.dependencyIndex.get(nsPattern);
+        if (!deps) { deps = new Set(); this.dependencyIndex.set(nsPattern, deps); }
+        deps.add(k);
       }
     }
 
@@ -840,6 +906,10 @@ export class CacheService {
     } else {
       this.l1.delete(k);
       this.disk.delete(k);
+      // Cascade: invalidate any key that declared it depends on this exact key's pattern
+      this._cascadeDependencies(k);
+      // Clean up: remove k from all dependency registrations (it is gone)
+      for (const [, dependents] of this.dependencyIndex) dependents.delete(k);
     }
 
     if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
@@ -1105,12 +1175,13 @@ export class CacheService {
    * });
    */
   async mset<T = unknown>(
-    entries: Record<string, { value: T; ttl?: number; priority?: CachePriority; tags?: string[] }>,
+    entries: Record<string, { value: T; ttl?: number; priority?: CachePriority; tags?: string[]; dependsOn?: string[] }>,
   ): Promise<void> {
     const keys = Object.keys(entries);
     await Promise.all(keys.map(key => {
-      const { value, ttl = 300, priority, tags } = entries[key];
-      return this.set(key, value, ttl, priority, tags ? { tags } : undefined);
+      const { value, ttl = 300, priority, tags, dependsOn } = entries[key];
+      const hasOpts = tags?.length || dependsOn?.length;
+      return this.set(key, value, ttl, priority, hasOpts ? { tags, dependsOn } : undefined);
     }));
   }
 
@@ -1296,6 +1367,107 @@ export class CacheService {
       disk: this.disk.stats,
     };
   }
+
+  // ── Conditional write ─────────────────────────────────────────────────
+
+  /**
+   * Write `value` only if the key is not already cached.
+   * Returns `true` if the write happened, `false` if the key already existed.
+   *
+   * When Redis is available, atomicity is guaranteed via `SET NX EX` so this
+   * is safe to use for idempotency keys and "first writer wins" patterns across
+   * multiple instances. L1 is populated on success.
+   *
+   * @example
+   * const claimed = await cache.setIfAbsent('idempotency:req_abc', payload, 300);
+   * if (!claimed) return res.status(409).json({ error: 'duplicate request' });
+   */
+  async setIfAbsent<T>(cacheKey: string, value: T, ttlSeconds = 300, priority?: CachePriority): Promise<boolean> {
+    const k = this.nk(cacheKey);
+
+    // Fast path: L1 check (process-local, no network hop)
+    if (this.l1.has(k)) return false;
+
+    if (!this._redisDisabled) {
+      try {
+        const client     = await this.getRedis();
+        const serialized = JSON.stringify(value);
+        const toStore    = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
+        // SET key value EX ttl NX — atomic; returns 'OK' on success, null if key exists
+        const result     = await client.set(k, toStore, 'EX', ttlSeconds, 'NX');
+        this.cb.onSuccess();
+        if (result === null) return false; // already exists in Redis
+      } catch (err) {
+        this.cb.onFailure();
+        this.logger.debug('setIfAbsent: Redis unavailable, falling back to L1 check', { cacheKey, error: (err as Error).message });
+        // Re-check L1 after Redis failure — another thread may have won the race
+        if (this.l1.has(k)) return false;
+      }
+    }
+
+    const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
+    const p     = priority ?? inferPriority(cacheKey);
+    this.l1.set(k, value, ttlMs, p);
+    this.counters.sets++;
+    return true;
+  }
+
+  // ── Hot key introspection ─────────────────────────────────────────────
+
+  /**
+   * Return the top-N live L1 keys by historical access frequency.
+   * Powered by the Count-Min Sketch — includes evicted-then-re-admitted keys
+   * whose historical frequency exceeds their current in-memory hit count.
+   *
+   * Useful for diagnosing what is driving L1 pressure without any extra data
+   * collection overhead.
+   *
+   * @param n - Maximum number of keys to return. Default: 10.
+   *
+   * @example
+   * cache.hotKeys(5).forEach(({ key, hits, sizeBytes }) =>
+   *   console.log(key, hits, (sizeBytes / 1024).toFixed(1) + ' KB'));
+   */
+  hotKeys(n = 10): Array<{ key: string; hits: number; sizeBytes: number }> {
+    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    return this.l1.hotKeys(n).map(({ key, hits, sizeBytes }) => ({
+      key: prefixLen > 0 ? key.slice(prefixLen) : key,
+      hits,
+      sizeBytes,
+    }));
+  }
+
+  // ── Dependency cascade helpers ────────────────────────────────────────
+
+  /**
+   * Test whether `key` (a concrete namespaced key) matches `pattern` (a glob
+   * pattern that may contain `*` wildcards).
+   */
+  private _matchesGlob(key: string, pattern: string): boolean {
+    if (!pattern.includes('*')) return key === pattern;
+    const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+    return re.test(key);
+  }
+
+  /**
+   * When an exact key `deletedKey` is removed, cascade to every dependent key
+   * that was registered via `dependsOn` and whose source pattern matches.
+   */
+  private _cascadeDependencies(deletedKey: string): void {
+    for (const [pattern, dependents] of this.dependencyIndex) {
+      if (!this._matchesGlob(deletedKey, pattern)) continue;
+      for (const dep of dependents) {
+        if (dep === deletedKey) continue; // no self-cascade
+        this.l1.delete(dep);
+        this.disk.delete(dep);
+        void this.publishInvalidation('del', dep);
+        this.logger.debug('Dependency cascade: invalidated dependent key', {
+          trigger: deletedKey.slice(0, 60), dependent: dep.slice(0, 60),
+        });
+      }
+    }
+  }
+
 
   // ── Observability ──────────────────────────────────────────────────────────────────
 

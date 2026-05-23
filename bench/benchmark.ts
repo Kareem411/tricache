@@ -924,6 +924,97 @@ console.log(
 await nsA.destroy();
 await nsB.destroy();
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  13. v0.4.0 new features — hotKeys, setIfAbsent, negative caching, refresh-ahead
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('hotKeys(n) — Count-Min Sketch hit ranking');
+note('Iterates all live L1 entries, queries sketch.estimate() per key, then sorts.');
+note('Cost is O(entries) for the scan + O(entries log entries) for the sort.');
+note('Larger L1 = slower hotKeys(). Consider calling at low frequency (e.g. every 10 s).');
+
+// Pre-fill svc with entries and simulate uneven access so the sketch has signal.
+for (let i = 0; i < 2_000; i++) await svc.set(`hkb:${i}`, { n: i }, 300);
+for (let i = 0; i < 600; i++) await svc.get(`hkb:${i % 2_000}`, async () => ({ n: i }), 300);
+
+await bench('hotKeys(10)  — 2 K live L1 entries', () => {
+  svc.hotKeys(10);
+}, 10_000, 500, 'O(n) sketch scan + O(n log n) sort + slice(0,10)');
+
+await bench('hotKeys(100) — 2 K live L1 entries', () => {
+  svc.hotKeys(100);
+}, 10_000, 500, 'same scan+sort, larger output slice');
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('setIfAbsent() — conditional write (L1-first, Redis NX fallback)');
+note('Fast path (key present in L1): l1.has() returns true → immediate false, no write.');
+note('Slow path (key absent from L1): l1.has() miss → l1.set() + bloom update → true.');
+note('With Redis disabled, there is no network hop; the L1 check is the entire cost.');
+
+const SIA_SIZE = 2_048;
+const SIA_MASK = SIA_SIZE - 1;
+for (let i = 0; i < SIA_SIZE; i++) await svc.set(`sia:hot:${i}`, 'v', 300);
+
+await bench('setIfAbsent — key already in L1 (no-op fast path)', async i => {
+  await svc.setIfAbsent(`sia:hot:${i & SIA_MASK}`, 'v', 300);
+}, 50_000, 1_000, 'l1.has() → true → return false immediately');
+
+// Fresh unique keys so L1 never pre-has them — tests the write path.
+let siaNewIdx = 0;
+await bench('setIfAbsent — new key, L1 miss → write', async () => {
+  await svc.setIfAbsent(`sia:new:${siaNewIdx++}`, 'v', 300);
+}, 20_000, 200, 'l1.has() miss → l1.set() + bloom.add → return true');
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Negative caching (notFoundTtl) — null-result L1 hit vs normal TTL routing');
+note('null results are cached like any other value — L1 get() cannot distinguish null from');
+note('"real" data. The only difference is the TTL written: notFoundTtl instead of ttlSeconds.');
+note('Subsequent L1 hits for null return immediately — no fetchFn call, no TTL logic.');
+
+// Pre-populate null sentinels with notFoundTtl=5 s
+const NF_SIZE = 1_024;
+const NF_MASK = NF_SIZE - 1;
+for (let i = 0; i < NF_SIZE; i++) {
+  await svc.get(`nf:${i}`, async () => null, 60, { notFoundTtl: 5 });
+}
+
+await bench('get — warm null hit (notFoundTtl cached)', async i => {
+  await svc.get(`nf:${i & NF_MASK}`, async () => null, 60, { notFoundTtl: 5 });
+}, 50_000, 1_000, 'null served from L1 — identical path to any non-null L1 hit');
+
+// Compare: same key, same TTL, non-null value — should be the same throughput.
+for (let i = 0; i < NF_SIZE; i++) await svc.set(`nf:real:${i}`, { v: i }, 300);
+
+await bench('get — warm non-null hit (same L1 path, for comparison)', async i => {
+  await svc.get(`nf:real:${i & NF_MASK}`, async () => ({ v: i }), 300);
+}, 50_000, 1_000, 'non-null L1 hit — baseline to confirm null path has no extra overhead');
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Refresh-ahead overhead — extra cost added to a warm L1 hit');
+note('refresh-ahead adds: l1.getEntry() (same Map lookup as l1.get) + two arithmetic ops.');
+note('When the key is fresh (not near expiry), the threshold check is false → no recompute.');
+note('The added latency should be negligible (<5% overhead) on modern hardware.');
+
+await svc.set('ra:bench', { n: 1 }, 300);
+
+const raBaseline = await bench('get — warm hit, NO refreshAhead (baseline)', async () => {
+  await svc.get('ra:bench', async () => ({ n: 2 }), 300);
+}, 50_000, 1_000, 'bloom → l1.get → return');
+
+const raAhead = await bench('get — warm hit, refreshAhead=0.8 (fresh key, no recompute)', async () => {
+  await svc.get('ra:bench', async () => ({ n: 2 }), 300, { refreshAhead: 0.8 });
+}, 50_000, 1_000, 'bloom → l1.get → threshold check (false) → return; no recompute');
+
+console.log(
+  `  ${C.dim}  Refresh-ahead overhead: ` +
+  `${((raAhead.nsPerOp - raBaseline.nsPerOp)).toFixed(1)} ns/op extra ` +
+  `(${((raAhead.nsPerOp / raBaseline.nsPerOp - 1) * 100).toFixed(1)}% overhead)${C.reset}`
+);
+note('If overhead > 10%: check that l1.getEntry() is inlined by V8 at this call site.');
+
 divider();
 const fm = svc.metrics();
 console.log(`\n${C.bold}  Final cache state${C.reset}`);

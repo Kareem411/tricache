@@ -42,6 +42,12 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 | **Pluggable logger** | Bring your own `pino`, `winston`, etc. |
 | **L2 read-only mode** | `l2WriteMode: 'read-only'` reads from Redis but skips all writes — canary deploys, read replicas |
 | **Eviction callback** | `onEviction(key, reason)` fires on every L1 eviction with a typed reason string |
+| **Negative caching (`notFoundTtl`)** | Cache `null`/`undefined` fetchFn results for a configurable TTL — prevents hammering upstream on repeated misses |
+| **`setIfAbsent()`** | Atomic "set if not cached" — L1 `has()` check → Redis `SET NX EX` → L1 set on success; returns `true` if written, `false` if already present |
+| **Refresh-ahead** | Proactively recompute an entry in the background when remaining TTL falls below a configured fraction — zero-latency freshness |
+| **XFetch probabilistic early expiry** | Probabilistic background recompute keyed to last fetch duration and `xfetchBeta` — optimal protection against expiry spikes under load |
+| **`hotKeys(n)`** | Returns top N keys by Count-Min Sketch access frequency with size — no full Map scan |
+| **`dependsOn` cascade invalidation** | Tag entries with parent keys; deleting a parent automatically evicts all declared dependents from L1 |
 
 ---
 
@@ -114,6 +120,17 @@ await cache.mdel([`user:${userIdA}`, `user:${userIdB}`]);
 // Warm L1 from Redis at startup
 const loaded = await cache.warmFromL2('user:*');
 console.log(`Pre-warmed ${loaded} user entries`);
+
+// Atomic set-if-absent — returns true if written, false if key already cached
+const written = await cache.setIfAbsent(`session:${id}`, sessionData, 3600);
+
+// Dependency cascade: deleting 'org:42' automatically evicts 'org:42:config'
+await cache.set('org:42:config', config, 300, undefined, { dependsOn: ['org:42'] });
+await cache.delete('org:42'); // also evicts org:42:config
+
+// Top 10 hottest keys by Count-Min Sketch frequency
+const hot = cache.hotKeys(10);
+console.log(hot); // [{ key: 'user:1', hits: 842, sizeBytes: 512 }, ...]
 
 // Tag entries for group invalidation
 await cache.set(`product:${id}`, product, 300, undefined, { tags: ['catalog'] });
@@ -217,6 +234,12 @@ CacheService.create({
   l2CircuitBreakerThreshold:  5,      // default
   l2CircuitBreakerCooldownMs: 30_000, // default
 
+  // ── Negative caching ──────────────────────────────────────────────────
+  // Cache null/undefined fetchFn results for this many seconds globally.
+  // Prevents repeated upstream calls for keys that genuinely don't exist.
+  // Can be overridden per-call via opts.notFoundTtl in cache.get().
+  notFoundTtl: 30, // seconds; 0 = disabled (default)
+
   // ── Prometheus instance label ─────────────────────────────────────────
   // Adds an `instance` label to every metric in toPrometheusText().
   instanceName: 'api-us-east-1',
@@ -273,6 +296,9 @@ Get from cache or call `fetchFn` on a miss. The inflight map ensures `fetchFn` f
 | `ttlSeconds` | `number` | `300` | Hard TTL in seconds |
 | `opts.swr` | `number` | `0` | Stale-While-Revalidate grace seconds |
 | `opts.priority` | `CachePriority` | auto-inferred | Eviction priority override |
+| `opts.refreshAhead` | `number` | — | Fraction `(0, 1]` of TTL — triggers background recompute when `remaining ≤ ttl × (1 - refreshAhead)` |
+| `opts.xfetchBeta` | `number` | — | XFetch β ≥ 0 — scales probabilistic early recompute by last fetch duration; higher = recompute earlier |
+| `opts.notFoundTtl` | `number` | — | Per-call TTL in seconds for `null`/`undefined` results (overrides global `notFoundTtl`) |
 
 ### `cache.set<T>(key, data, ttlSeconds?, priority?, opts?)` → `Promise<void>`
 
@@ -281,9 +307,14 @@ Writes to L1 and (in production) L2. Publishes an invalidation to the backplane.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `opts.tags` | `string[]` | `[]` | Associate tags with this entry for group invalidation |
+| `opts.dependsOn` | `string[]` | `[]` | Parent keys — when any parent is deleted, this entry is automatically evicted from L1 |
 
 ```typescript
 await cache.set('product:1', data, 60, undefined, { tags: ['catalog', 'featured'] });
+
+// Cascade invalidation: evicting 'org:42' also evicts 'org:42:members'
+await cache.set('org:42:members', members, 300, undefined, { dependsOn: ['org:42'] });
+await cache.delete('org:42'); // org:42:members is evicted too
 ```
 
 ### `cache.mget<T>(keys, fetchFn, ttlSeconds?, priority?)` → `Promise<(T | undefined)[]>`
@@ -351,6 +382,32 @@ Return the L1 value only if it is **fresh** (not yet in the SWR grace window). R
 ```typescript
 const fresh = cache.getIfFresh<User>('user:123');
 if (fresh !== null) return fresh; // serve from L1, no network hop
+```
+
+### `cache.setIfAbsent<T>(key, value, ttlSeconds?)` → `Promise<boolean>`
+
+Atomically write `value` only if `key` is not already cached. Checks L1 first, then attempts a Redis `SET NX EX`. Returns `true` if the value was written, `false` if a live entry already existed.
+
+Useful for distributed lock-style writes, session initialisation, or any pattern where you must not overwrite an already-cached value.
+
+```typescript
+const written = await cache.setIfAbsent(`session:${id}`, sessionData, 3600);
+if (!written) {
+  // session already exists — do not overwrite
+}
+```
+
+### `cache.hotKeys(n?)` → `Array<{ key: string; hits: number; sizeBytes: number }>`
+
+Returns the top `n` live L1 keys ranked by Count-Min Sketch access frequency. Namespace prefix is stripped from each key. Expired entries are excluded. Default `n = 10`.
+
+```typescript
+const hot = cache.hotKeys(5);
+// [
+//   { key: 'user:1',    hits: 1024, sizeBytes: 512 },
+//   { key: 'product:7', hits:  893, sizeBytes: 256 },
+//   ...
+// ]
 ```
 
 ### `cache.invalidateTag(tag)` → `Promise<void>`

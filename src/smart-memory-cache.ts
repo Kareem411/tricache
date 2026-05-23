@@ -391,7 +391,7 @@ export class SmartMemoryCache {
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
     const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
     const isStale = entry.staleAt !== undefined && now > entry.staleAt;
-    return { value, isStale };
+    return { value, isStale, expiresAt: entry.expiresAt, ttlMs: entry.ttlMs, delta: entry.delta };
   }
 
   set(
@@ -400,6 +400,7 @@ export class SmartMemoryCache {
     ttlMs: number,
     priority: CachePriority = 2 /* NORMAL */,
     staleAt?: number,
+    delta?: number,
   ): void {
     // Single serialization pass — always msgpackr. Eliminates the prior JSON.stringify
     // "size probe" that was discarded for large payloads (the double-pass).
@@ -427,7 +428,7 @@ export class SmartMemoryCache {
     this.ensureCapacity(cat, size);
 
     const now = Date.now();
-    this.cache.set(key, { data: packed, value: data, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority });
+    this.cache.set(key, { data: packed, value: data, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta });
     this.bloom.add(key);
     this.maybeRebuildBloom();
     this.totalSize += size;
@@ -729,4 +730,22 @@ export class SmartMemoryCache {
 
   bloomMightContain(key: string): boolean { return this.bloom.mightContain(key); }
   bloomStats() { return this.bloom.stats; }
+
+  /**
+   * Return the top-N live L1 keys by historical access frequency (Count-Min Sketch estimate).
+   * Includes evicted-then-readmitted keys whose sketch frequency exceeds their current hit count.
+   * Useful for diagnosing which keys are driving cache pressure.
+   *
+   * @param n - Maximum number of entries to return. Default: 10.
+   */
+  hotKeys(n: number): Array<{ key: string; hits: number; sizeBytes: number }> {
+    const now = Date.now();
+    const out: Array<{ key: string; hits: number; sizeBytes: number }> = [];
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt <= now) continue;
+      out.push({ key, hits: this.sketch.estimate(key), sizeBytes: entry.size });
+    }
+    out.sort((a, b) => b.hits - a.hits);
+    return out.slice(0, n);
+  }
 }

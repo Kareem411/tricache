@@ -101,6 +101,10 @@ export interface SmartCacheEntry {
   lastAccess: number;
   /** Eviction priority */
   priority: CachePriority;
+  /** Original TTL in ms at write time — used by refresh-ahead to compute the proactive refresh threshold. */
+  ttlMs?: number;
+  /** Milliseconds taken to fetch/compute this value — used by XFetch probabilistic early expiration. */
+  delta?: number;
 }
 
 /** Returned by SmartMemoryCache.get() — distinguishes "cached null" from a real miss */
@@ -108,6 +112,13 @@ export interface CacheHit {
   value: unknown;
   /** true = past soft TTL (staleAt) but within hard expiry → SWR path */
   isStale: boolean;
+  /** Hard expiry timestamp — lets CacheService.get() do refresh-ahead / XFetch math
+   *  without a second Map lookup (eliminates the duplicate l1.getEntry() call). */
+  expiresAt: number;
+  /** Original TTL in ms stored at write time — for refresh-ahead fraction calculation */
+  ttlMs?: number;
+  /** Fetch duration in ms stored at write time — for XFetch probabilistic threshold */
+  delta?: number;
 }
 
 // ─── Disk tier ───────────────────────────────────────────────────────────────
@@ -441,6 +452,14 @@ export interface CacheOptions {
   ttlJitterFactor?: number;
 
   // ── L2 circuit breaker ─────────────────────────────────────────────────────
+  /**
+   * Default TTL in seconds for `null` or `undefined` results from `fetchFn`.
+   * Caches negative results so a non-existent key (deleted user, bad ID) does not
+   * hit the DB on every request. Can be overridden per-call via `get(..., { notFoundTtl }).
+   * Default: `0` (disabled — null/undefined uses the normal TTL).
+   */
+  notFoundTtl?: number;
+
   /**
    * Number of consecutive Redis errors before the circuit opens (stops
    * attempting Redis until the cooldown elapses).
