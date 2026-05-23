@@ -6,10 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x%20%7C%206.x-blue)](https://www.typescriptlang.org)
-[![L1 get](https://img.shields.io/badge/L1%20get-2.65%20M%2Fs-brightgreen)](BENCHMARKS.md)
+[![L1 get](https://img.shields.io/badge/L1%20get-2.81%20M%2Fs-brightgreen)](BENCHMARKS.md)
 [![Thundering herd](https://img.shields.io/badge/thundering%20herd-100%25%20coalesced-brightgreen)](BENCHMARKS.md)
 
-tricache is an extremely fast three-tier Node.js cache library. It serves warm reads at **2.65 million operations per second** from a single thread — over 100× faster than a localhost Redis round-trip and below any network latency floor. When L1 fills, evicted entries spill to a local NVMe disk tier rather than being dropped, keeping hit rates high without unbounded RAM growth. Cache misses that reach L2 (Redis or Valkey) are automatically coalesced: no matter how many concurrent callers miss the same key, `fetchFn` fires exactly once. See the [performance section](#-performance) for full numbers. Stale-While-Revalidate, AES-256-GCM at-rest encryption, pub/sub fleet-wide invalidation, OOM guard, cold-start snapshots, and Prometheus metrics are also supported through optional configuration — with zero required fields to get started.
+tricache is an extremely fast three-tier Node.js cache library. It serves warm reads at **2.81 million operations per second** from a single thread — over 100× faster than a localhost Redis round-trip and below any network latency floor. When L1 fills, evicted entries spill to a local NVMe disk tier rather than being dropped, keeping hit rates high without unbounded RAM growth. Cache misses that reach L2 (Redis or Valkey) are automatically coalesced: no matter how many concurrent callers miss the same key, `fetchFn` fires exactly once. See the [performance section](#-performance) for full numbers. Stale-While-Revalidate, AES-256-GCM at-rest encryption, pub/sub fleet-wide invalidation, OOM guard, cold-start snapshots, and Prometheus metrics are also supported through optional configuration — with zero required fields to get started.
 
 <img src="https://raw.githubusercontent.com/Kareem411/TriCache/master/public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
 
@@ -705,52 +705,52 @@ Measured on a single Node.js thread (no `await` on synchronous paths):
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — hot hit (8K entries) | **2.60 M/s** | 385 ns | bloom → Map lookup → return cached value |
-| `get` — cold miss | **7.07 M/s** | 141 ns | bloom gates → early return |
+| `get` — hot hit (8K entries) | **2.81 M/s** | 356 ns | bloom → Map lookup → return cached value |
+| `get` — cold miss | **7.14 M/s** | 140 ns | bloom gates → early return |
 | `set` — tiny payload | 899 K/s | 1.11 µs | pack() + Map.set + bloom.add |
 | `set` — small payload (≈ 512 B) | 554 K/s | 1.81 µs | pack() same unified path, larger payload |
 | `set` — large payload (≥ 512 B) | 205.3 K/s | 4.87 µs | pack() larger payload |
 | `set` — CRITICAL priority | 730.1 K/s | 1.37 µs | same set path; skipped in eviction sort |
-| `delete` — exact key | **3.94 M/s** | 254 ns | Map.delete |
+| `delete` — exact key | **5.36 M/s** | 186 ns | Map.delete |
 | `deletePattern` — glob wildcard | 7.2 K/s | 138 µs | O(n) Map scan |
-| Count-Min Sketch estimate | **2.97 M/s** | 336 ns | 4 row lookups — called on every `get()` hit and `set()` |
+| Count-Min Sketch estimate | **3.37 M/s** | 297 ns | 4 row lookups — called on every `get()` hit and `set()` |
 
 **Iterator interface (L1 live entries, 500 entries)**
 
 | Method | Throughput | Latency | Notes |
 |---|---|---|---|
-| `cache.keys()` | 34.1 K/s | 29 µs | no `[key,entry]` tuple allocation — +19 % vs v0.2.0 |
-| `cache.values()` | 33.6 K/s | 30 µs | `yield*` delegation — +4 % vs v0.2.0 |
-| `cache.entries()` | 24.5 K/s | 41 µs | `[strippedKey, value]` pairs |
-| raw `Map` iteration (baseline) | 351 K/s | 2.85 µs | no expiry check, no generator overhead |
+| `cache.keys()` | 26.6 K/s | 37.53 µs | no `[key,entry]` tuple allocation |
+| `cache.values()` | 35.5 K/s | 28.19 µs | `yield*` delegation |
+| `cache.entries()` | 24.0 K/s | 41.73 µs | `[strippedKey, value]` pairs |
+| raw `Map` iteration (baseline) | 277.2 K/s | 3.61 µs | no expiry check, no generator overhead |
 
 **CacheService (end-to-end)**
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — L1 warm hit | **1.86 M/s** | 539 ns | inflight check → l1.get → return cached value |
-| `get` — SWR stale serve | **796 K/s** | 1.26 µs | serves stale; revalidates async |
+| `get` — L1 warm hit | **2.03 M/s** | 491 ns | inflight check → l1.get → return cached value |
+| `get` — SWR stale serve | **1.78 M/s** | 562 ns | serves stale; revalidates async |
 | `get` — miss + fetchFn | 13.7 K/s | 73 µs | Promise microtask + l1.set |
-| `set` | 31.0 K/s | 32 µs | l1.set + disk.save (fire-and-forget) |
-| `delete` — exact key | 7.9 K/s | 126 µs | l1.delete + disk.delete + backplane |
+| `set` | 28.7 K/s | 34.86 µs | l1.set + disk.save (fire-and-forget) |
+| `delete` — exact key | 7.3 K/s | 137.82 µs | l1.delete + disk.delete + backplane |
 | `delete` — glob `*` | 687 K/s | 1.46 µs | l1.deletePattern O(n) + disk glob |
 
 **Encryption** (IV pool, pre-allocated output buffers)
 
 | Mode | Payload | Encrypt | Decrypt |
 |---|---|---|---|
-| AES-256-GCM | 64 B | 114 K/s / 8.75 µs | 133 K/s / 7.52 µs |
-| AES-256-GCM | 512 B | 70.3 K/s / 14.21 µs | 114 K/s / 8.80 µs |
-| AES-256-GCM | 4 KB | 41.7 K/s / 23.99 µs | 43.0 K/s / 23.24 µs |
-| AES-128-GCM | 64 B | 127 K/s / 7.89 µs | 145 K/s / 6.91 µs |
-| AES-128-GCM | 512 B | 90.8 K/s / 11.01 µs | 132 K/s / 7.59 µs |
-| AES-128-GCM | 4 KB | 48.9 K/s / 20.47 µs | 42.9 K/s / 23.32 µs |
-| AES-128-CTR | 64 B | 181 K/s / 5.51 µs | 192 K/s / 5.21 µs |
-| AES-128-CTR | 512 B | 175 K/s / 5.71 µs | 182 K/s / 5.50 µs |
-| AES-128-CTR | 4 KB | 61.8 K/s / 16.18 µs | 54.0 K/s / 18.51 µs |
-| XOR _(obfuscation only)_ | 64 B | 2.37 M/s / 422 ns | 2.11 M/s / 475 ns |
-| XOR _(obfuscation only)_ | 512 B | 598 K/s / 1.67 µs | 513 K/s / 1.95 µs |
-| XOR _(obfuscation only)_ | 4 KB | 82.7 K/s / 12.09 µs | 146 K/s / 6.84 µs |
+| AES-256-GCM | 64 B | 140.4 K/s / 7.12 µs | 155.5 K/s / 6.43 µs |
+| AES-256-GCM | 512 B | 103.1 K/s / 9.70 µs | 142.9 K/s / 6.99 µs |
+| AES-256-GCM | 4 KB | 58.4 K/s / 17.12 µs | 48.0 K/s / 20.84 µs |
+| AES-128-GCM | 64 B | 148.8 K/s / 6.72 µs | 173.0 K/s / 5.78 µs |
+| AES-128-GCM | 512 B | 135.7 K/s / 7.37 µs | 158.8 K/s / 6.30 µs |
+| AES-128-GCM | 4 KB | 70.2 K/s / 14.24 µs | 53.2 K/s / 18.79 µs |
+| AES-128-CTR | 64 B | 187.9 K/s / 5.32 µs | 196.9 K/s / 5.08 µs |
+| AES-128-CTR | 512 B | 183.5 K/s / 5.45 µs | 185.6 K/s / 5.39 µs |
+| AES-128-CTR | 4 KB | 78.4 K/s / 12.75 µs | 71.8 K/s / 13.93 µs |
+| XOR _(obfuscation only)_ | 64 B | 2.43 M/s / 412 ns | 2.10 M/s / 476 ns |
+| XOR _(obfuscation only)_ | 512 B | 665.5 K/s / 1.50 µs | 715.3 K/s / 1.40 µs |
+| XOR _(obfuscation only)_ | 4 KB | 114.5 K/s / 8.73 µs | 77.6 K/s / 12.89 µs |
 
 > AES and XOR string-path numbers shown (Redis L2). Buffer path (disk/snapshot) is 5–20% faster — no base64 overhead.  
 > AES-128-GCM is 5–50% faster than AES-256-GCM depending on payload (gap widens at mid-range sizes on AES-NI hardware).  
