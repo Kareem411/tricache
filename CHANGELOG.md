@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-23
+
+### Fixed
+
+- **Backplane-aware `dependsOn` cascade** — When a fleet peer published a `del` message for a parent key, the receiving instance evicted the parent from its L1 but did not cascade to any entries that declared `dependsOn` containing that key. The cascade (`_cascadeDependencies`) now runs on every incoming `del` backplane message, not just on the originating instance. Single-process behavior is unchanged; fleet environments now correctly evict dependents on all nodes.
+
+### Added
+
+- **`mget` per-key TTL** — The `ttl` parameter of `cache.mget()` now accepts a function `(key: string) => number` in addition to a plain `number`. The function is called only for miss keys, enabling heterogeneous TTLs in a single batch call. Plain-number callers are unaffected.
+
+  ```typescript
+  const results = await cache.mget(
+    ['user:1', 'config:global', 'user:2'],
+    fetchFn,
+    (key) => key.startsWith('config:') ? 3600 : 300,
+  );
+  ```
+
+- **`cache.ready()` — startup warm-up lifecycle hook** — Returns a `Promise<void>` that resolves once the cache is fully initialised and any startup warming configured via `warmKeys` has completed. Resolves immediately when `warmKeys` is not set. Designed for k8s readiness probes: gate traffic until L1 is warm, then open the gate once and never block again.
+
+- **`warmKeys` option** — Companion to `cache.ready()`. Pass a Redis key glob pattern (`'user:*'`) to automatically call `warmFromL2(warmKeys)` at construction time. No-op when Redis is disabled or unreachable.
+
+  ```typescript
+  const cache = CacheService.create({ warmKeys: 'user:*' });
+  await cache.ready(); // resolves once warmFromL2('user:*') finishes
+  // k8s readiness endpoint returns 200 only after this point
+  ```
+
+---
+
 ## [0.4.0] — 2026-05-23
 
 ### Added

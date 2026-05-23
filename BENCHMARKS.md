@@ -6,7 +6,9 @@
 
 All numbers are from one live run on the same machine. Throughput varies ±5–10 % across runs due to JIT warmth and OS scheduling. Re-run with `pnpm bench` to reproduce on your hardware.
 
-> **v0.3.1 additions:** TTL jitter (`ttlJitterFactor`), batch `mset()` / `mdel()`, native OpenTelemetry spans (`tracer`), L2 circuit breaker (`l2CircuitBreakerThreshold` / `l2CircuitBreakerCooldownMs`), and `warmFromL2(pattern)` startup warming.
+> **v0.4.1 additions:** backplane-aware `dependsOn` cascade (fleet correctness fix), `mget` per-key TTL function, and `cache.ready()` + `warmKeys` startup lifecycle hook.
+
+> **v0.4.0 additions:** TTL jitter (`ttlJitterFactor`), batch `mset()` / `mdel()`, native OpenTelemetry spans (`tracer`), L2 circuit breaker (`l2CircuitBreakerThreshold` / `l2CircuitBreakerCooldownMs`), and `warmFromL2(pattern)` startup warming.
 
 > **v0.3.0 additions:** Count-Min Sketch frequency tracking (4 KB, 84 % burst-flood survival rate) and a lazy iterator interface (`keys()` / `values()` / `entries()`) on `CacheService`. See the dedicated sections below.
 
@@ -313,4 +315,29 @@ git clone https://github.com/Kareem411/TriCache.git
 cd TriCache
 pnpm install
 pnpm bench
+```
+
+---
+
+## v0.4.1 — New API surface notes
+
+These additions have no measurable impact on the hot `get()` / `set()` throughput numbers above — they operate on cold or startup paths. Noted here for completeness.
+
+### `mget` per-key TTL function
+
+When `ttl` is a function, it is called **only for miss keys** — L1 hits bypass it entirely. The resolved TTL is passed to the existing `set()` path, so jitter, disk spill, and Redis write all behave identically to a plain-number TTL. No additional overhead on warm hits.
+
+### `dependsOn` backplane cascade fix
+
+Previously: instance A deletes `org:42` → cascade evicts `org:42:members` on A only. Instances B and C evicted `org:42` but not its dependents.
+
+Now: `_handleBackplaneMessage` calls `_cascadeDependencies(msg.key)` on receipt. The dependency index walk is O(p × d) where p = registered parent patterns and d = average dependents per pattern — both typically small (single digits in production). No measurable effect on backplane throughput.
+
+### `cache.ready()` / `warmKeys`
+
+`ready()` returns a stored Promise — O(1), no async work on repeated calls. `warmKeys` triggers exactly one `warmFromL2()` at construction; the Promise is stored and returned by all `ready()` calls thereafter. The readiness probe pattern is:
+
+```ts
+const cache = CacheService.create({ warmKeys: 'user:*' });
+await cache.ready(); // blocks only the first caller; subsequent awaits resolve immediately
 ```

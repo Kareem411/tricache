@@ -522,4 +522,143 @@ describe('dependsOn — dependency-aware cascade invalidation', () => {
     // The key registered as dependent is 'self:1', not 'unrelated:item'
     expect(svc.has('self:1')).toBe(false); // correctly cascaded
   });
+
+  it('backplane message triggers cascade on the receiving instance', async () => {
+    // Simulate a fleet peer: instance A deletes the parent key and publishes
+    // a 'del' backplane message. Instance B (svc) receives it via
+    // _handleBackplaneMessage. The dependent registered on instance B should
+    // be evicted even though instance B never called delete() directly.
+    const nsParent = (svc as unknown as { nk: (k: string) => string }).nk('org:99');
+    const nsDependent = (svc as unknown as { nk: (k: string) => string }).nk('org:99:config');
+
+    // Register the dependent on this instance (as if it handled a set())
+    await svc.set('org:99:config', 'cfg', 60, undefined, { dependsOn: ['org:99'] });
+    expect(svc.has('org:99:config')).toBe(true);
+
+    // Simulate a peer publishing a delete for the parent — use a different src
+    // so the skip-own-message guard doesn't fire.
+    const peerMessage = JSON.stringify({ op: 'del', key: nsParent, src: 'peer-instance-id' });
+    (svc as unknown as { _handleBackplaneMessage: (m: string) => void })
+      ._handleBackplaneMessage(peerMessage);
+
+    // Dependent must be gone — cascade ran on the receiving side
+    expect(svc.has('org:99:config')).toBe(false);
+
+    void nsDependent; // suppress unused-variable warning
+  });
+});
+
+// ─── 7. mget per-key TTL ─────────────────────────────────────────────────────
+
+describe('mget — per-key TTL function', () => {
+  let svc: CacheService;
+  let diskDir: string;
+
+  beforeEach(() => ({ svc, diskDir } = makeService()));
+  afterEach(() => {
+    svc.destroy();
+    try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('accepts a plain number TTL (backwards compat)', async () => {
+    const results = await svc.mget(
+      ['k:1', 'k:2'],
+      (keys) => Promise.resolve(Object.fromEntries(keys.map(k => [k, k]))),
+      120,
+    );
+    expect(results).toEqual(['k:1', 'k:2']);
+    expect(svc.ttl('k:1')).toBeGreaterThan(0);
+    expect(svc.ttl('k:1')).toBeLessThanOrEqual(120);
+  });
+
+  it('applies per-key TTL via function', async () => {
+    const ttlFn = (key: string) => key.startsWith('long:') ? 600 : 60;
+
+    await svc.mget(
+      ['long:a', 'short:b'],
+      (keys) => Promise.resolve(Object.fromEntries(keys.map(k => [k, k]))),
+      ttlFn,
+    );
+
+    const longTtl  = svc.ttl('long:a');
+    const shortTtl = svc.ttl('short:b');
+
+    expect(longTtl).not.toBeNull();
+    expect(shortTtl).not.toBeNull();
+    // long: key must have a meaningfully larger TTL than short: key
+    expect(longTtl!).toBeGreaterThan(shortTtl! + 60);
+  });
+
+  it('each miss key gets its own independently resolved TTL', async () => {
+    const ttls: Record<string, number> = { 'item:a': 30, 'item:b': 90, 'item:c': 180 };
+    const ttlFn = (key: string) => ttls[key] ?? 60;
+
+    await svc.mget(
+      ['item:a', 'item:b', 'item:c'],
+      (keys) => Promise.resolve(Object.fromEntries(keys.map(k => [k, k]))),
+      ttlFn,
+    );
+
+    expect(svc.ttl('item:a')).toBeLessThanOrEqual(30);
+    expect(svc.ttl('item:b')).toBeLessThanOrEqual(90);
+    expect(svc.ttl('item:c')).toBeLessThanOrEqual(180);
+    // Confirm ordering: a < b < c
+    expect(svc.ttl('item:a')!).toBeLessThan(svc.ttl('item:b')!);
+    expect(svc.ttl('item:b')!).toBeLessThan(svc.ttl('item:c')!);
+  });
+
+  it('TTL function is only called for miss keys, not L1 hits', async () => {
+    // Pre-populate item:x in L1
+    await svc.set('item:x', 'cached', 300);
+    const ttlFn = vi.fn((key: string) => key === 'item:y' ? 45 : 300);
+
+    await svc.mget(
+      ['item:x', 'item:y'],
+      (keys) => Promise.resolve(Object.fromEntries(keys.map(k => [k, k]))),
+      ttlFn,
+    );
+
+    // ttlFn should only be called for the miss key 'item:y'
+    expect(ttlFn).toHaveBeenCalledOnce();
+    expect(ttlFn).toHaveBeenCalledWith('item:y');
+  });
+});
+
+// ─── 8. cache.ready() ────────────────────────────────────────────────────────
+
+describe('cache.ready()', () => {
+  let svc: CacheService;
+  let diskDir: string;
+
+  afterEach(() => {
+    svc.destroy();
+    try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('resolves immediately when warmKeys is not configured', async () => {
+    ({ svc, diskDir } = makeService());
+    await expect(svc.ready()).resolves.toBeUndefined();
+  });
+
+  it('resolves immediately when Redis is disabled (warmKeys is a no-op)', async () => {
+    ({ svc, diskDir } = makeService({ warmKeys: 'user:*' }));
+    // Redis is disabled — warmFromL2 returns 0 immediately; ready() should still resolve
+    await expect(svc.ready()).resolves.toBeUndefined();
+  });
+
+  it('returns the same Promise on repeated calls', async () => {
+    ({ svc, diskDir } = makeService());
+    const p1 = svc.ready();
+    const p2 = svc.ready();
+    expect(p1).toBe(p2);
+  });
+
+  it('resolves before first get() is called (no race with warmKeys)', async () => {
+    ({ svc, diskDir } = makeService({ warmKeys: 'session:*' }));
+    // Await ready before serving any traffic
+    await svc.ready();
+    // Basic sanity: cache still works after ready resolves
+    await svc.set('session:1', 'data', 60);
+    expect(svc.has('session:1')).toBe(true);
+  });
 });

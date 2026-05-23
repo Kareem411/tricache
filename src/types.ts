@@ -472,4 +472,10 @@ export interface CacheOptions {
    * Default: `30 000` ms (30 s).
    */
   l2CircuitBreakerCooldownMs?: number;
+  /**
+   * Redis key pattern to automatically warm L1 from at startup (e.g. `'user:*'`).
+   * `cache.ready()` returns a Promise that resolves once this warm-up completes.
+   * No-op when Redis is disabled or unreachable — safe to set unconditionally.
+   */
+  warmKeys?: string;
 }

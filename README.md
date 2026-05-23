@@ -121,6 +121,10 @@ await cache.mdel([`user:${userIdA}`, `user:${userIdB}`]);
 const loaded = await cache.warmFromL2('user:*');
 console.log(`Pre-warmed ${loaded} user entries`);
 
+// Or auto-warm at construction + gate traffic with ready()
+const cache2 = CacheService.create({ warmKeys: 'user:*' });
+await cache2.ready(); // resolves once warm-up completes — ideal for k8s readiness probes
+
 // Atomic set-if-absent — returns true if written, false if key already cached
 const written = await cache.setIfAbsent(`session:${id}`, sessionData, 3600);
 
@@ -240,6 +244,12 @@ CacheService.create({
   // Can be overridden per-call via opts.notFoundTtl in cache.get().
   notFoundTtl: 30, // seconds; 0 = disabled (default)
 
+  // ── Startup warm-up ───────────────────────────────────────────────────
+  // Auto-call warmFromL2(pattern) at construction time.
+  // cache.ready() resolves once warm-up finishes — use as a k8s readiness gate.
+  // No-op when Redis is disabled or unreachable.
+  warmKeys: 'user:*',
+
   // ── Prometheus instance label ─────────────────────────────────────────
   // Adds an `instance` label to every metric in toPrometheusText().
   instanceName: 'api-us-east-1',
@@ -317,15 +327,25 @@ await cache.set('org:42:members', members, 300, undefined, { dependsOn: ['org:42
 await cache.delete('org:42'); // org:42:members is evicted too
 ```
 
-### `cache.mget<T>(keys, fetchFn, ttlSeconds?, priority?)` → `Promise<(T | undefined)[]>`
+### `cache.mget<T>(keys, fetchFn, ttl?, priority?)` → `Promise<(T | undefined)[]>`
 
 Batch read. Returns L1-cached values for hot keys; calls `fetchFn` only with the keys that missed. Preserves input ordering.
 
+`ttl` accepts a **plain number** (uniform TTL) or a **function `(key: string) => number`** (per-key TTL). The function is only called for miss keys — L1 hits are unaffected.
+
 ```typescript
+// Uniform TTL
 const [userA, userB] = await cache.mget(
   ['user:1', 'user:2'],
   (missKeys) => db.users.findByIds(missKeys).then(rowsToMap),
   300,
+);
+
+// Per-key TTL — heterogeneous data in one batch call
+const results = await cache.mget(
+  ['user:1', 'config:global', 'feature:flags'],
+  fetchFn,
+  (key) => key.startsWith('config:') ? 3600 : 300,
 );
 ```
 
@@ -356,6 +376,22 @@ Scan Redis for keys matching a glob pattern (e.g. `'user:*'`) and load their val
 // In your application startup
 const loaded = await cache.warmFromL2('user:*');
 console.log(`Pre-warmed ${loaded} user entries from Redis`);
+```
+
+### `cache.ready()` → `Promise<void>`
+
+Returns a Promise that resolves once the cache is fully initialised. Without `warmKeys`, resolves immediately. With `warmKeys`, resolves once the automatic `warmFromL2` call completes.
+
+Designed for k8s readiness probes — await before accepting traffic, then never call again:
+
+```typescript
+const cache = CacheService.create({ warmKeys: 'user:*' });
+
+// k8s readiness probe endpoint
+app.get('/ready', async (_req, res) => {
+  await cache.ready();
+  res.sendStatus(200);
+});
 ```
 
 ### `cache.has(key)` → `boolean`

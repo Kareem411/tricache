@@ -150,6 +150,7 @@ export class CacheService {
     ttlJitterFactor: number;
     tracer: ICacheTracer | undefined;
     notFoundTtl: number;
+    warmKeys: string | undefined;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -169,6 +170,7 @@ export class CacheService {
   private redisConnecting:     Promise<RedisClient> | null = null;
   private readonly cb:         L2CircuitBreaker;
   private snapshotLoaded       = false;
+  private _readyPromise:       Promise<void> = Promise.resolve();
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
   private metricsInterval:     ReturnType<typeof setInterval> | null = null;
@@ -255,6 +257,7 @@ export class CacheService {
       ttlJitterFactor:          Math.min(Math.max(options.ttlJitterFactor ?? 0, 0), 1),
       tracer:                   options.tracer,
       notFoundTtl:              options.notFoundTtl ?? 0,
+      warmKeys:                 options.warmKeys,
     };
 
     // Circuit breaker for L2 Redis
@@ -337,6 +340,11 @@ export class CacheService {
     this.instanceId       = crypto.randomBytes(8).toString('hex');
     this.backplaneChannel = `tricache:inv${ns ? ':' + ns : ''}`;
     this.initBackplane();
+
+    // Auto-warm from L2 if warmKeys is configured; ready() waits for completion.
+    if (this.opts.warmKeys) {
+      this._readyPromise = this.warmFromL2(this.opts.warmKeys).then(() => undefined);
+    }
   }
 
   // ── Singleton factory ─────────────────────────────────────────────────────
@@ -460,6 +468,11 @@ export class CacheService {
         // message returns immediately without blocking hot get() calls.
         this.l1.delete(msg.key);
         setImmediate(() => this.disk.delete(msg.key));
+        // Cascade: evict dependents registered on this instance for the
+        // deleted key — same logic the local delete() path runs, now also
+        // applied to peer-originated invalidations so fleet-wide deletes
+        // propagate dependency cascades to every node.
+        this._cascadeDependencies(msg.key);
       } else if (msg.op === 'del-glob') {
         // Glob patterns clean L1 only — disk entries expire naturally via
         // the background purge timer or are bypassed on the next L1 miss.
@@ -1127,12 +1140,13 @@ export class CacheService {
    *
    * @param keys    - Array of cache keys.
    * @param fetchFn - Called with only the keys that missed L1.
-   * @param ttl     - TTL in seconds for newly fetched values.
+   * @param ttl     - TTL in seconds for newly fetched values. Accepts a per-key function
+   *                  `(key) => number` so heterogeneous TTLs can be batched in one call.
    */
   async mget<T>(
     keys: string[],
     fetchFn: (missKeys: string[]) => Promise<Record<string, T>>,
-    ttl = 300,
+    ttl: number | ((key: string) => number) = 300,
     priority?: CachePriority,
   ): Promise<(T | undefined)[]> {
     const result: (T | undefined)[] = new Array(keys.length);
@@ -1156,12 +1170,28 @@ export class CacheService {
         const v = fetched[missKeys[j]];
         result[missIndexes[j]] = v;
         if (v !== undefined) {
-          await this.set(missKeys[j], v, ttl, priority);
+          const resolvedTtl = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
+          await this.set(missKeys[j], v, resolvedTtl, priority);
         }
       }
     }
 
     return result;
+  }
+
+  /**
+   * Returns a Promise that resolves once the cache is fully initialised and any
+   * startup warming configured via `warmKeys` has completed.
+   *
+   * Without `warmKeys`, resolves immediately. With `warmKeys`, resolves once
+   * `warmFromL2(warmKeys)` finishes — ideal for k8s readiness probes.
+   *
+   * @example
+   * const cache = CacheService.create({ warmKeys: 'user:*' });
+   * await cache.ready(); // gate traffic until warm
+   */
+  ready(): Promise<void> {
+    return this._readyPromise;
   }
 
   /**
