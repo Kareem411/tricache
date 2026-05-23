@@ -279,7 +279,7 @@ await bench('get — definite miss (novel key, never set)', i => {
 
 await bench('get — hit path (key confirmed in bloom)', i => {
   l1.get(bfHotKeys[i & BF_HOT_MASK]);
-}, 500_000, 5_000, '7 hash rounds → Map.get → decompress if needed');
+}, 500_000, 5_000, '7 hash rounds → Map.get → return cached value');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  3. Compression cost vs savings
@@ -814,7 +814,7 @@ const catL1 = new SmartMemoryCache({
 for (let i = 0; i < 200; i++) {
   catL1.set(`user:${i}`, { id: i, name: `u${i}` }, 300_000, CachePriority.HIGH);
 }
-const userCountBefore = catL1.getStats().categories['user:'] ?? 0;
+const userCountBefore = catL1.getStats().categories['user:']?.entries ?? 0;
 
 // Flood analytics: well beyond its 100-entry limit at LOW priority.
 // Each set() triggers ensureCapacity → smartEvict → 4 entries evicted from
@@ -832,8 +832,8 @@ await bench(
 
 {
   const statsPost = catL1.getStats();
-  const userAfter = statsPost.categories['user:']      ?? 0;
-  const analAfter = statsPost.categories['analytics:'] ?? 0;
+  const userAfter = statsPost.categories['user:']?.entries      ?? 0;
+  const analAfter = statsPost.categories['analytics:']?.entries ?? 0;
   const userLost  = userCountBefore - userAfter;
   const protection = ((1 - userLost / Math.max(1, userCountBefore)) * 100).toFixed(1);
   console.log(`  ${C.dim}  user: before → after analytics: flood: ${userCountBefore} → ${userAfter} (${userLost} evicted)${C.reset}`);
@@ -890,15 +890,33 @@ for (let i = 0; i < NS_HOT; i++) {
   await nsB.set(`hot:${i}`, { v: i }, 300);
 }
 
+// Pre-generate a deterministic random sequence shared by both tenant benchmarks.
+// This ensures org_a and org_b see the exact same operation distribution so
+// JIT-warmth differences (org_a runs first) don't skew the parity ratio.
+const NS_RAND = Array.from({ length: 10_200 }, () => Math.random());
+
 const nsMixed = (ns: CacheService) => async (i: number): Promise<void> => {
-  const r = Math.random();
+  const r = NS_RAND[i % NS_RAND.length];
   if      (r < 0.80) { await ns.get(`hot:${i % NS_HOT}`,  async () => ({ v: i }), 300); }
   else if (r < 0.95) { await ns.get(`miss:${i % 100}`, async () => ({ v: i }), 5); }
   else               { await ns.set(`hot:${i % NS_HOT}`,  { v: i }, 300); }
 };
 
-const nsResA = await bench('  org_a — 80/15/5 workload', nsMixed(nsA), 10_000, 200, 'independent L1 + disk + inflight Map');
-const nsResB = await bench('  org_b — 80/15/5 workload', nsMixed(nsB), 10_000, 200, 'independent L1 + disk + inflight Map');
+// Interleaved warmup: alternate between both closures so the JIT compiles and
+// optimises the shared CacheService / inflight-Map hot paths identically for
+// both namespaces before either timed run begins.  Without this, org_b would
+// inherit org_a's JIT-compiled code for free, inflating its measured ops/s.
+const fnA = nsMixed(nsA);
+const fnB = nsMixed(nsB);
+const PARITY_WARMUP = 400;
+for (let i = 0; i < PARITY_WARMUP; i++) {
+  await fnA(i);
+  await fnB(i);
+}
+
+// warmup=0: the interleaved pass above already warmed both call-sites equally.
+const nsResA = await bench('  org_a — 80/15/5 workload', fnA, 10_000, 0, 'independent L1 + disk + inflight Map');
+const nsResB = await bench('  org_b — 80/15/5 workload', fnB, 10_000, 0, 'independent L1 + disk + inflight Map');
 console.log(
   `  ${C.dim}  Throughput ratio A/B: ${(nsResA.opsPerSec / nsResB.opsPerSec).toFixed(2)}× — expect ≈ 1.0 (fully independent)${C.reset}`
 );

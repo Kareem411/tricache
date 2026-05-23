@@ -20,6 +20,31 @@ export const consoleLogger: ILogger = {
   error: (msg, meta, err) => console.error('[tricache]', msg, meta ?? '', err ?? ''),
 };
 
+// ─── Eviction reason ────────────────────────────────────────────────────────
+
+/**
+ * Reason passed to the `onEviction` callback.
+ * - `'capacity'`  — L1 over-capacity; evicted during a `set()` call
+ * - `'category'`  — Per-category limit exceeded
+ * - `'rebalance'` — `cache.rebalance()` was called
+ * - `'oom'`       — OOM guard emergency eviction
+ * - `'ttl'`       — Entry expired during periodic cleanup
+ * - `'manual'`    — Explicit `cache.delete()` call
+ */
+export type EvictionReason = 'capacity' | 'category' | 'rebalance' | 'oom' | 'ttl' | 'manual';
+
+// ─── Ping result ─────────────────────────────────────────────────────────────
+
+/** Per-tier latency returned by `cache.ping()`. */
+export interface CachePingResult {
+  /** L1 RAM check latency in milliseconds */
+  l1:   number;
+  /** L1.5 disk stats access in milliseconds */
+  disk: number;
+  /** L2 Redis PING round-trip in milliseconds, or `null` when Redis is disabled */
+  l2:   number | null;
+}
+
 // ─── Cache priorities ────────────────────────────────────────────────────────
 
 /** Priority levels for L1 eviction — higher = less likely to be evicted */
@@ -34,8 +59,14 @@ export enum CachePriority {
 
 /** Internal representation of a single cache entry in the L1 Map */
 export interface SmartCacheEntry {
-  /** msgpackr-packed binary payload */
+  /** msgpackr-packed binary payload — used for disk spill and snapshot serialization */
   data: Buffer;
+  /**
+   * Deserialized JS value, cached at write time so hot reads skip the unpack step entirely.
+   * Undefined for entries restored from disk/snapshot (populated lazily on first access).
+   * NOTE: returned by reference — callers should treat the value as immutable.
+   */
+  value?: unknown;
   /** always true for entries written by the current code;
    *  may be false in legacy snapshots/disk files — handled transparently on import */
   isCompressed: boolean;
@@ -236,6 +267,16 @@ export interface CacheOptions {
    * Default: `'aes-256-gcm'`
    */
   encryptionMode?: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
+  /**
+   * Fallback encryption key for zero-downtime key rotation.
+   * On every read, tricache tries the current `encryptionKey` first.
+   * If decryption fails (wrong key), it retries with `previousEncryptionKey`.
+   * All writes always use the current `encryptionKey`.
+   * Remove this field once you are confident all data has been re-encrypted.
+   */
+  previousEncryptionKey?: string;
+  /** Encryption mode that was used with `previousEncryptionKey`. Defaults to `encryptionMode`. */
+  previousEncryptionMode?: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
 
   // ── Snapshot ────────────────────────────────────────────────────────────
   /**
@@ -269,6 +310,39 @@ export interface CacheOptions {
    * Default: `''` (no prefix)
    */
   namespace?: string;
+
+  /**
+   * Seconds to extend a stale SWR entry's life when background revalidation fails.
+   * Without this, a failed revalidation leaves the entry stale until its hard TTL
+   * expires, after which the next caller blocks. With `staleIfError`, tricache bumps
+   * the expiry by this many seconds on every failed revalidation, keeping the stale
+   * value available while the underlying service is degraded.
+   * Default: `0` (disabled — entry expires normally on revalidation failure).
+   */
+  staleIfError?: number;
+
+  /**
+   * Called after every L1 eviction. Receives the raw (namespaced) key and the reason.
+   * Useful for diagnosing cache pressure and tuning `categoryLimits`.
+   */
+  onEviction?: (key: string, reason: EvictionReason) => void;
+
+  /**
+   * Human-readable name for this CacheService instance. Added as an `instance` label
+   * to all Prometheus metrics emitted by `CacheService.toPrometheusText()`.
+   * Required when multiple CacheService instances share a process — without it,
+   * metric names from different instances collide.
+   * Default: `''` (no label).
+   */
+  instanceName?: string;
+
+  /**
+   * Controls whether writes are propagated to L2 (Redis).
+   * - `'read-write'` (default): read from and write to L2.
+   * - `'read-only'`:  read from L2 but never write, delete, or expire keys in Redis.
+   *   Use for shared read replicas or external Redis clusters you do not own.
+   */
+  l2WriteMode?: 'read-write' | 'read-only';
 
   // ── Invalidation backplane (Redis Pub/Sub) ──────────────────────────────
   /**

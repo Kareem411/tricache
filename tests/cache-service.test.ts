@@ -107,12 +107,11 @@ describe('CacheService.set / delete', () => {
 });
 
 describe('CacheService.increment', () => {
-  it('returns 0 when Redis is disabled (safe dev fallback)', async () => {
-    // increment is a Redis-only operation — in test mode (disableRedis: true) it safely returns 0
+  it('accumulates in L1 when Redis is disabled', async () => {
     const c1 = await svc.increment('counter:hits', 60);
     const c2 = await svc.increment('counter:hits', 60);
-    expect(c1).toBe(0);
-    expect(c2).toBe(0);
+    expect(c1).toBe(1);
+    expect(c2).toBe(2);
   });
 });
 

@@ -13,7 +13,7 @@
  */
 
 import { pack, unpack } from 'msgpackr';
-import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger } from './types';
+import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason } from './types';
 import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
 
@@ -107,6 +107,7 @@ export interface SmartMemoryCacheOptions {
   maxEntries:  number;
   categories:  Record<string, CategoryLimit>;
   diskSpill?:  (key: string, entry: SmartCacheEntry) => void | Promise<void>;
+  onEviction?: (key: string, reason: EvictionReason) => void;
   logger:      ILogger;
 }
 
@@ -125,8 +126,7 @@ export class SmartMemoryCache {
   // ── Observability counters ──────────────────────────────────────────────────────
   private bloomChecks           = 0;
   private bloomFalsePos         = 0;
-  private compressions          = 0;
-
+  private compressions          = 0;  private categoryHits          = new Map<string, number>();
   /** Counts every _delete() call — used to trigger bloom rebuild from ALL deletion paths. */
   private _bloomDirtyCount      = 0;
 
@@ -171,7 +171,7 @@ export class SmartMemoryCache {
     return this.opts.categories[cat] ?? this.opts.categories['default'] ?? { maxEntries: 500, maxSizeBytes: 50 * 1024 * 1024 };
   }
 
-  private _delete(key: string): boolean {
+  private _delete(key: string, reason: EvictionReason = 'manual'): boolean {
     const entry = this.cache.get(key);
     if (!entry) return false;
     const cat = this.getCategory(key);
@@ -180,7 +180,11 @@ export class SmartMemoryCache {
     this.categorySize.set(cat, (this.categorySize.get(cat) ?? entry.size) - entry.size);
     this.categoryKeys.get(cat)?.delete(key);
     this._bloomDirtyCount++;
-    return this.cache.delete(key);
+    const deleted = this.cache.delete(key);
+    if (deleted && this.opts.onEviction) {
+      try { this.opts.onEviction(key, reason); } catch { /* never crash cache */ }
+    }
+    return deleted;
   }
 
   private ensureCapacity(category: string, neededSize: number): void {
@@ -287,7 +291,7 @@ export class SmartMemoryCache {
     for (const { key } of pool.slice(0, EVICT)) {
       const entry = this.cache.get(key);
       if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry); // L1.5 spill
-      this._delete(key);
+      this._delete(key, 'capacity');
     }
   }
 
@@ -299,10 +303,14 @@ export class SmartMemoryCache {
     const entry = this.cache.get(key);
     if (!entry) { this.bloomFalsePos++; return null; }
     const now = Date.now();
-    if (entry.expiresAt < now) { this._delete(key); return null; }
+    if (entry.expiresAt < now) { this._delete(key, 'ttl'); return null; }
     entry.hits++;
     entry.lastAccess = now;
-    const value = unpack(entry.data as Buffer);
+    const cat = this.getCategory(key);
+    this.categoryHits.set(cat, (this.categoryHits.get(cat) ?? 0) + 1);
+    // value is cached at write time — hot reads return the live object directly,
+    // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
+    const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
     const isStale = entry.staleAt !== undefined && now > entry.staleAt;
     return { value, isStale };
   }
@@ -339,7 +347,7 @@ export class SmartMemoryCache {
     this.ensureCapacity(cat, size);
 
     const now = Date.now();
-    this.cache.set(key, { data: packed, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority });
+    this.cache.set(key, { data: packed, value: data, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority });
     this.bloom.add(key);
     this.maybeRebuildBloom();
     this.totalSize += size;
@@ -351,7 +359,7 @@ export class SmartMemoryCache {
   }
 
   delete(key: string): boolean {
-    const deleted = this._delete(key);
+    const deleted = this._delete(key, 'manual');
     if (deleted) this.maybeRebuildBloom();
     return deleted;
   }
@@ -366,9 +374,86 @@ export class SmartMemoryCache {
 
   deletePattern(pattern: string): number {
     let n = 0;
-    for (const key of this.keysMatchingPattern(pattern)) if (this._delete(key)) n++;
+    for (const key of this.keysMatchingPattern(pattern)) if (this._delete(key, 'manual')) n++;
     if (n > 0) this.maybeRebuildBloom();
     return n;
+  }
+
+  /** Flush all entries, or only those whose key starts with `prefix`. */
+  clear(prefix?: string): number {
+    if (prefix) {
+      const pattern = prefix.includes('*') ? prefix : `${prefix}*`;
+      return this.deletePattern(pattern);
+    }
+    const count = this.cache.size;
+    this.cache.clear();
+    this.totalSize = 0;
+    this.categoryCount.clear();
+    this.categorySize.clear();
+    this.categoryKeys.clear();
+    this.categoryHits.clear();
+    this.bloom.reset();
+    this._bloomDirtyCount = 0;
+    return count;
+  }
+
+  /**
+   * Evict entries that violate current category or global limits.
+   * Returns the number of entries evicted.
+   */
+  rebalance(): number {
+    const now = Date.now();
+    let evicted = 0;
+
+    for (const [cat, limit] of Object.entries(this.opts.categories)) {
+      const catKeys = this.categoryKeys.get(cat);
+      if (!catKeys || catKeys.size === 0) continue;
+
+      let catCnt = this.categoryCount.get(cat) ?? 0;
+      let catSz  = this.categorySize.get(cat)  ?? 0;
+      if (catCnt <= limit.maxEntries && catSz <= limit.maxSizeBytes) continue;
+
+      const candidates: Array<{ key: string; score: number }> = [];
+      for (const key of catKeys) {
+        const entry = this.cache.get(key);
+        if (!entry) continue;
+        if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
+        candidates.push({ key, score: this.score(entry, 0, now) });
+      }
+      candidates.sort((a, b) => a.score - b.score);
+
+      for (const { key } of candidates) {
+        catCnt = this.categoryCount.get(cat) ?? 0;
+        catSz  = this.categorySize.get(cat)  ?? 0;
+        if (catCnt <= limit.maxEntries && catSz <= limit.maxSizeBytes) break;
+        const entry = this.cache.get(key);
+        if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry);
+        this._delete(key, 'rebalance');
+        evicted++;
+      }
+    }
+
+    // Global limits
+    while (this.cache.size > this.opts.maxEntries || this.totalSize > this.opts.maxBytes) {
+      const before = this.cache.size;
+      this.smartEvict('default', false);
+      if (this.cache.size >= before) break; // only CRITICAL entries remain
+      evicted += before - this.cache.size;
+    }
+
+    if (evicted > 0) this.maybeRebuildBloom();
+    return evicted;
+  }
+
+  /**
+   * Return remaining TTL in seconds for a key in L1, or null if absent/expired.
+   * Only reflects L1 state — does not query Redis or disk.
+   */
+  ttl(key: string): number | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    const remaining = entry.expiresAt - Date.now();
+    return remaining > 0 ? Math.ceil(remaining / 1000) : null;
   }
 
   /**
@@ -393,7 +478,7 @@ export class SmartMemoryCache {
     for (const { key } of candidates.slice(0, count)) {
       const entry = this.cache.get(key);
       if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry);
-      this._delete(key);
+      this._delete(key, 'oom');
       evicted++;
     }
     return evicted;
@@ -402,7 +487,7 @@ export class SmartMemoryCache {
   cleanup(): number {
     const now = Date.now();
     let cleaned = 0;
-    for (const [key, entry] of this.cache) if (entry.expiresAt < now) { this._delete(key); cleaned++; }
+    for (const [key, entry] of this.cache) if (entry.expiresAt < now) { this._delete(key, 'ttl'); cleaned++; }
     if (cleaned > 0) { this.bloom.rebuild(this.cache.keys()); this._bloomDirtyCount = 0; }
     return cleaned;
   }
@@ -435,7 +520,9 @@ export class SmartMemoryCache {
         : rawData instanceof Uint8Array
           ? Buffer.from(rawData)                          // msgpackr Uint8Array → Buffer
           : rawData as Buffer;                            // already a Buffer
-      this.cache.set(key, { ...entry, data, isCompressed: true });
+      // Decode once on import so subsequent gets return the live object without unpacking.
+      const value = unpack(data);
+      this.cache.set(key, { ...entry, data, value, isCompressed: true });
       this.bloom.add(key);
       loaded++;
     }
@@ -449,11 +536,14 @@ export class SmartMemoryCache {
   get memoryUsage(): number { return this.totalSize; }
 
   getStats() {
-    const categories: Record<string, number> = {};
-    for (const [cat, cnt] of this.categoryCount) categories[cat] = cnt;
+    const categories: Record<string, { entries: number; hits: number }> = {};
+    for (const [cat, cnt] of this.categoryCount) {
+      categories[cat] = { entries: cnt, hits: this.categoryHits.get(cat) ?? 0 };
+    }
     return {
-      entries:  this.cache.size,
-      sizeKB:   Math.round(this.totalSize / 1024),
+      entries:   this.cache.size,
+      sizeBytes: this.totalSize,
+      sizeKB:    Math.round(this.totalSize / 1024),
       categories,
       bloom: {
         checks:         this.bloomChecks,
@@ -465,6 +555,57 @@ export class SmartMemoryCache {
         bytesSaved:   0,              // no longer tracked (unified format removes the split path)
       },
     };
+  }
+
+  /**
+   * Return the raw cache entry for a key, or `undefined` if absent/expired.
+   * Does NOT count as a hit or perform SWR logic.
+   */
+  getEntry(key: string): SmartCacheEntry | undefined {
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) return undefined;
+    return entry;
+  }
+
+  /**
+   * Return true if the key exists in L1 and has not expired.
+   * Uses the bloom filter as a fast negative check.
+   */
+  has(key: string): boolean {
+    if (!this.bloom.mightContain(key)) return false;
+    const entry = this.cache.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt <= Date.now()) {
+      this._delete(key, 'ttl');
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Extend the TTL of an existing key. Returns `false` if the key is absent or expired.
+   * @param newTtlMs - New TTL from now, in milliseconds.
+   */
+  touch(key: string, newTtlMs: number): boolean {
+    const entry = this.cache.get(key);
+    if (!entry) return false;
+    const now = Date.now();
+    if (entry.expiresAt <= now) { this._delete(key, 'ttl'); return false; }
+    entry.expiresAt = now + newTtlMs;
+    return true;
+  }
+
+  /**
+   * Add additional milliseconds to a key's existing expiry (for stale-if-error).
+   * Returns `false` if the key is absent or already expired.
+   */
+  bumpExpiry(key: string, additionalMs: number): boolean {
+    const entry = this.cache.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt <= Date.now()) return false;
+    entry.expiresAt += additionalMs;
+    return true;
   }
 
   bloomMightContain(key: string): boolean { return this.bloom.mightContain(key); }

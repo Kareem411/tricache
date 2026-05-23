@@ -1,0 +1,118 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.0] — 2026-05-23
+
+### Performance
+
+- **L1 hot-get: +112 % throughput** (1.25 M/s → 2.65 M/s, 800 ns → 377 ns) — Every cache entry now stores the deserialized JS value alongside its msgpackr buffer. `get()` returns the live object directly — zero `unpack()` call on the hot path. The packed buffer (`data`) is retained for disk spill and cold-start snapshot serialization, so cross-process behavior is unchanged.
+
+- **Bloom-filter hit path: +44 % throughput** (2.26 M/s → 3.26 M/s) — direct benefit of eliminating the `unpack()` call that followed the Map lookup.
+
+- **CacheService L1 warm-hit: +64 % throughput** (1.32 M/s → 2.16 M/s) — `getIfFresh()` and `mget()` also return `entry.value` directly, skipping deserialization end-to-end.
+
+- **CacheService SWR stale-serve: +38 % throughput** (1.48 M/s → 2.04 M/s) — same `entry.value` fast path in the stale-serve code.
+
+- **`set` throughput unchanged** — `set()` still calls `pack()` exactly once; the only addition is storing the reference as `entry.value` (a pointer copy, not a serialization round-trip).
+
+> **Memory note:** each L1 entry now holds both the packed `Buffer` and the live JS object. For a typical cache payload this roughly doubles the per-entry heap overhead vs a packed-only store. The `size` field (used for eviction pressure) still reflects `packed.byteLength` — tune `l1MaxEntries` / `l1MaxBytes` accordingly.
+
+> **Reference semantics:** `get()` now returns a direct reference to the cached object, not a fresh deep copy. Mutating the returned value will corrupt the cached entry. This is consistent with high-performance in-process caches (node-lru-cache, quick-lru, etc.). If immutability is required, deep-clone at the call site.
+
+### Fixed
+
+- **Benchmark `[object Object]` logger bug** — The multi-tenancy category-starvation section was printing raw `{ entries, hits }` objects in template strings because `getStats().categories[key]` returns `{ entries: number; hits: number }`, not a plain number. The relevant variables now correctly access `.entries`.
+
+- **Benchmark tenant-parity variance** — `org_a` and `org_b` namespace throughput benchmarks previously used independent `Math.random()` calls, so each run saw a different operation distribution. Both namespaces now share a single pre-generated random sequence so they execute identical workloads and JIT-warmth effects don't skew the A/B ratio.
+
+- **Benchmark tenant-parity JIT warmth** — Even with an identical operation sequence, `org_b` was still faster because it ran after `org_a`'s 10 000 timed iterations had already compiled all shared CacheService / inflight-Map hot paths. Both closures are now materialised upfront and warmed in an interleaved pass (400 alternating iterations each) before either timed run begins. Parity ratio is now consistently ≈ 1.00× (previously 0.74–0.81×).
+
+### Added
+
+- **`cache.clear(prefix?)`** — Flush all cached entries with a single call. Passing an optional prefix (e.g. `'user:abc'`) limits the flush to keys with that prefix, scoped to L1 and Redis. Replaces the previous workaround of `delete('prefix:*')`.
+
+- **`cache.rebalance()`** — Evict L1 entries that violate the current category or global capacity limits. Useful when `categoryLimits` are tightened after startup; previously, existing entries were never re-evaluated until they expired naturally.
+
+- **`cache.ttl(key)`** — Return the remaining TTL in seconds for a key currently held in L1, without fetching or consuming the value. Returns `null` if the key is absent or expired. Useful for SWR decisions and debugging.
+
+- **`cache.writeSnapshot(altPath?)`** — `writeSnapshot()` now accepts an optional path argument. Calling `writeSnapshot('/tmp/backup.snap')` writes to that path without touching the configured default snapshot file. Useful in graceful-shutdown hooks. The zero-argument form is unchanged.
+
+- **`DiskTier.clear()`** — Internal method used by `cache.clear()` to flush the entire L1.5 disk tier.
+
+- **`cache.has(key)`** — Return `true` if the key exists in L1 and has not expired. Uses the bloom filter as a fast-path negative check. No fetch, no disk or Redis round-trip.
+
+- **`cache.touch(key, newTtlSeconds)`** — Extend the TTL of a key in L1 (and fire-and-forget `EXPIRE` in Redis) without reading or re-fetching its value. Returns `false` if the key is absent or already expired.
+
+- **`cache.getIfFresh(key)`** — Return the L1-cached value only if it is fresh (not yet in the SWR grace window). Returns `null` when absent, expired, or stale — without triggering a revalidation. Useful for read-your-writes patterns.
+
+- **`cache.mget(keys, fetchFn, ttl)`** — Batch read. Returns cached values for hot keys and calls `fetchFn` only with the keys that missed L1. Preserves input ordering.
+
+- **Tag-based invalidation** — Tag entries on write and invalidate whole groups atomically:
+  ```ts
+  await cache.set('product:1', data, 60, undefined, { tags: ['catalog'] });
+  await cache.invalidateTag('catalog'); // evicts all entries tagged 'catalog'
+  ```
+  Tags are tracked in-process and mirrored to Redis `SADD`/`SMEMBERS` for multi-instance consistency.
+
+- **`cache.ping()`** — Measure L1 / disk / Redis latency in milliseconds. Returns `{ l1, disk, l2 }` — `l2` is `null` when Redis is disabled. Suitable for health-check endpoints.
+
+- **`cache.drainToL2()`** — Pipeline all live L1 entries to Redis in a single round-trip. Useful for warming a new Redis node or for zero-downtime failover.
+
+- **`CacheService.createAsync(optionsOrPromise)`** — Async factory that resolves a `Promise<CacheOptions>` before constructing the singleton. Useful when configuration is fetched from a secret store at startup.
+
+- **`staleIfError` option** — Number of seconds to extend a stale L1 entry's expiry when a SWR revalidation fetch fails. Prevents serving errors while the upstream is temporarily down.
+  ```ts
+  CacheService.create({ staleIfError: 300 }) // keep stale for 5 more minutes on error
+  ```
+
+- **`l2WriteMode` option** — Set to `'read-only'` to allow Redis reads (L2 hits, snapshot load) while skipping all Redis writes (`set`, `delete`, `clear`, tag sync). Useful for read-replicas, canary deployments, or cost-reduction in read-heavy workloads.
+  ```ts
+  CacheService.create({ l2WriteMode: 'read-only' })
+  ```
+
+- **`onEviction` callback** — Called synchronously whenever L1 evicts a key, with the key name and the reason (`'capacity'` | `'category'` | `'rebalance'` | `'oom'` | `'ttl'` | `'manual'`). Never throws — errors inside the callback are silently swallowed to protect cache stability.
+  ```ts
+  CacheService.create({
+    onEviction: (key, reason) => metrics.increment(`cache.eviction.${reason}`),
+  })
+  ```
+
+- **`instanceName` option** — Prometheus `instance` label added to every metric emitted by `toPrometheusText()`. Useful when multiple `CacheService` instances push to the same Prometheus endpoint.
+  ```ts
+  CacheService.create({ instanceName: 'api-us-east-1' })
+  ```
+
+- **`previousEncryptionKey` / `previousEncryptionMode` options** — Zero-downtime encryption key rotation. The cache tries the current key first; if decryption fails it transparently retries with the previous key. Remove `previousEncryptionKey` after all old entries have expired.
+  ```ts
+  CacheService.create({
+    encryptionKey:         newKeyBase64,
+    previousEncryptionKey: oldKeyBase64,
+  })
+  ```
+
+- **`stats().l1.categories` format** — Each category entry now exposes both `entries` (count of live keys) and `hits` (L1 cache hits since startup), instead of only the entry count. Old code that read `stats().l1.categories['prefix:']` as a plain number should read `.entries` or `.hits` instead.
+
+### Fixed
+
+- **`increment()` now works without Redis** — Previously `increment()` silently returned `0` every call when Redis was disabled (the default in non-production environments), making any rate-limiting logic that compared the result against a threshold permanently bypassable. It now maintains per-key counters in L1 memory with the same TTL semantics, returning `1`, `2`, `3`… as expected. Behaviour with Redis enabled is unchanged.
+
+- **`stats().l1` now exposes `sizeBytes`** — `stats().l1` previously only returned `sizeKB` (a rounded integer) while the internal tracking and `metrics().l1` used raw bytes. Both `sizeBytes` (exact) and `sizeKB` (rounded, kept for backwards compatibility) are now present on `stats().l1`.
+
+- **Redis reconnect bug** — When the initial Redis connection attempt failed, the internal `redisConnecting` Promise was cached in the rejected state and never reset. All subsequent calls to any Redis-backed method would fail immediately without retrying. The rejected Promise is now cleared on failure, allowing the next call to attempt a fresh connection.
+
+### Migration
+
+All additions are backward-compatible with one exception:
+
+- `writeSnapshot()` with no arguments behaves identically to `0.1.0`.
+- `stats().l1.sizeKB` is still present; `sizeBytes` is a new addition.
+- `increment()` return values change from `0` to an accumulating count **only when Redis is disabled**. If your code compared the result to a threshold (e.g. `if (count >= limit) { ... }`), it will now work correctly in dev/test. If you were explicitly relying on the `0` return to detect a disabled-Redis state, check `cache.metrics().backplane.enabled` instead.
+- **`stats().l1.categories` shape changed** — values changed from `number` to `{ entries: number; hits: number }`. Update any code reading `stats().l1.categories[key]` directly.
+
+## [0.1.0] — 2026-05-01
+
+Initial release.

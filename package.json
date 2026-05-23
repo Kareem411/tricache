@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -36,16 +36,16 @@
     "LICENSE"
   ],
   "scripts": {
-    "build":      "tsup src/index.ts --format esm,cjs --dts --clean",
-    "dev":        "tsup src/index.ts --format esm,cjs --dts --watch",
-    "typecheck":  "tsc --noEmit",
-    "test":       "vitest run",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "test:watch": "vitest",
-    "bench":      "node --import tsx/esm bench/benchmark.ts"
+    "bench": "node --import tsx/esm bench/benchmark.ts"
   },
   "dependencies": {
     "ioredis": "^5.3.2",
-    "msgpackr": "^1.10.1"
+    "msgpackr": "^2.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -57,6 +57,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
+  "homepage": "https://github.com/Kareem411/TriCache#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kareem411/TriCache.git"

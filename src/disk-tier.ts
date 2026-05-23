@@ -18,8 +18,7 @@ import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
 import { pack, unpack }  from 'msgpackr';
-import type { DiskCacheEntry, ILogger } from './types';
-
+import { DiskCacheEntry, ILogger } from './types.js';
 // ── Encryption (self-contained to avoid circular import) ─────────────────────
 
 const AES_ALGO  = 'aes-256-gcm' as const;
@@ -291,6 +290,23 @@ export class DiskTier {
       } catch { /* skip locked/gone */ }
     }
     return purged;
+  }
+
+  /** Delete every file in the disk cache. Returns the count deleted. */
+  clear(): number {
+    this.ensureDir();
+    if (!this.dirReady) return 0;
+    let cleared = 0;
+    for (const filePath of this.walkCacheFiles()) {
+      try {
+        const stat = fs.statSync(filePath);
+        fs.unlinkSync(filePath);
+        this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+        this.fileCount = Math.max(0, this.fileCount - 1);
+        cleared++;
+      } catch { /* skip locked/gone */ }
+    }
+    return cleared;
   }
 
   get stats(): { files: number; sizeKB: number; maxKB: number } {

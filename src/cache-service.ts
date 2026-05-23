@@ -17,11 +17,12 @@
  */
 
 import { Redis as RedisClient } from 'ioredis';
+import { pack, unpack } from 'msgpackr';
 import crypto from 'crypto';
 import os    from 'os';
 import fs    from 'fs';
 import path  from 'path';
-import { pack, unpack } from 'msgpackr';
+
 
 import {
   CachePriority,
@@ -30,6 +31,7 @@ import {
   DiskCacheEntry,
   CacheOptions,
   CacheMetrics,
+  CachePingResult,
   ILogger,
   consoleLogger,
 } from './types';
@@ -89,6 +91,9 @@ export class CacheService {
     oomCheckIntervalMs: number; oomEvictPercent: number;
     onMetrics: ((m: CacheMetrics) => void) | undefined;
     metricsIntervalMs: number;
+    staleIfError: number;
+    l2WriteMode: 'read-write' | 'read-only';
+    instanceName: string;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -96,6 +101,9 @@ export class CacheService {
   private readonly _redisDisabled:  boolean;
   private readonly inflight    = new Map<string, Promise<unknown>>();
   private readonly revalidating = new Set<string>();
+  private readonly _l1Counters = new Map<string, { value: number; expiresAt: number }>();
+  /** tag → Set of namespaced cache keys; maintained in-process for O(1) invalidateTag() */
+  private readonly tagIndex    = new Map<string, Set<string>>();
   private redis:               RedisClient | null = null;
   private redisConnecting:     Promise<RedisClient> | null = null;
   private snapshotLoaded       = false;
@@ -135,7 +143,13 @@ export class CacheService {
 
     // Resolve encryption key: option > env var
     const encKeyRaw = options.encryptionKey ?? process.env.CACHE_ENCRYPTION_KEY;
-    this.enc = new CacheEncryption(encKeyRaw, logger, options.encryptionMode);
+    this.enc = new CacheEncryption(
+      encKeyRaw,
+      logger,
+      options.encryptionMode,
+      options.previousEncryptionKey,
+      options.previousEncryptionMode,
+    );
 
     // When a namespace is active, scope the forbidden prefixes so that
     // auth/session keys like `org_abc:auth:token` are still protected.
@@ -173,6 +187,9 @@ export class CacheService {
       oomEvictPercent:          options.oomEvictPercent    ?? 0.20,
       onMetrics:                options.onMetrics,
       metricsIntervalMs:        options.metricsIntervalMs  ?? 60_000,
+      staleIfError:             options.staleIfError       ?? 0,
+      l2WriteMode:              options.l2WriteMode        ?? 'read-write',
+      instanceName:             options.instanceName       ?? '',
     };
 
     // L1.5 disk tier
@@ -194,6 +211,7 @@ export class CacheService {
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
       diskSpill:  (key: string, entry: SmartCacheEntry) => { void this.disk.save(key, entry as unknown as DiskCacheEntry); },
+      onEviction: options.onEviction,
       logger,
     });
 
@@ -267,6 +285,18 @@ export class CacheService {
     const key = CacheService.globalKey(options);
     if (!g[key]) g[key] = new CacheService(options);
     return g[key] as CacheService;
+  }
+
+  /**
+   * Async factory — accepts a Promise that resolves to CacheOptions.
+   * Useful when config is fetched from a secret store at startup.
+   *
+   * @example
+   * const cache = await CacheService.createAsync(fetchSecrets());
+   */
+  static async createAsync(options: Promise<CacheOptions> | CacheOptions): Promise<CacheService> {
+    const resolved = await options;
+    return CacheService.create(resolved);
   }
 
   /** Replace the singleton (useful in tests). */
@@ -365,32 +395,37 @@ export class CacheService {
     if (this.redisConnecting) return this.redisConnecting;
 
     this.redisConnecting = (async () => {
-      const client = new RedisClient({
-        host:                  this.opts.redisHost,
-        port:                  this.opts.redisPort,
-        tls:                   this.opts.redisTls ? {} : undefined,
-        connectTimeout:        10_000,
-        lazyConnect:           false,
-        maxRetriesPerRequest:  3,
-        enableAutoPipelining:  true,
-        keepAlive:             30_000,
-        family:                4,
-        retryStrategy: (times: number) => Math.min(times * 50, 2_000),
-      });
+      try {
+        const client = new RedisClient({
+          host:                  this.opts.redisHost,
+          port:                  this.opts.redisPort,
+          tls:                   this.opts.redisTls ? {} : undefined,
+          connectTimeout:        10_000,
+          lazyConnect:           false,
+          maxRetriesPerRequest:  3,
+          enableAutoPipelining:  true,
+          keepAlive:             30_000,
+          family:                4,
+          retryStrategy: (times: number) => Math.min(times * 50, 2_000),
+        });
 
-      client.on('connect',      () => this.logger.info('Redis connected', { host: this.opts.redisHost }));
-      client.on('error',        (e: Error) => this.logger.error('Redis error', { host: this.opts.redisHost }, e));
-      client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
+        client.on('connect',      () => this.logger.info('Redis connected', { host: this.opts.redisHost }));
+        client.on('error',        (e: Error) => this.logger.error('Redis error', { host: this.opts.redisHost }, e));
+        client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
 
-      await new Promise<void>((resolve, reject) => {
-        client.once('ready', resolve);
-        client.once('error', reject);
-        setTimeout(() => reject(new Error('Redis connection timeout')), 15_000);
-      });
+        await new Promise<void>((resolve, reject) => {
+          client.once('ready', resolve);
+          client.once('error', reject);
+          setTimeout(() => reject(new Error('Redis connection timeout')), 15_000);
+        });
 
-      this.redis = client;
-      this.redisConnecting = null;
-      return client;
+        this.redis = client;
+        this.redisConnecting = null;
+        return client;
+      } catch (err) {
+        this.redisConnecting = null; // allow retry on next call — fixes the cached-rejection bug
+        throw err;
+      }
     })();
 
     return this.redisConnecting;
@@ -398,7 +433,7 @@ export class CacheService {
 
   // ── Snapshot (cold-start persistence) ────────────────────────────────────
 
-  writeSnapshot(): void {
+  writeSnapshot(altPath?: string): void {
     try {
       const entries = this.l1.exportEntries(this.opts.forbiddenSnapshotPrefixes);
       if (entries.length === 0) return;
@@ -406,10 +441,11 @@ export class CacheService {
       const payload = { version: SNAPSHOT_VERSION, writtenAt: Date.now(), entries };
       const packed  = pack(payload);
       const final   = this.enc.isEnabled ? this.enc.encryptBuffer(packed) : packed;
+      const dest    = altPath ?? this.opts.snapshotPath;
 
-      fs.writeFileSync(this.opts.snapshotPath, final, { mode: 0o600 });
+      fs.writeFileSync(dest, final, { mode: 0o600 });
       this.logger.info('Cache snapshot written', {
-        path: this.opts.snapshotPath, entries: entries.length,
+        path: dest, entries: entries.length,
         sizeKB: Math.round(final.length / 1024), encrypted: this.enc.isEnabled,
       });
     } catch (err) {
@@ -609,7 +645,7 @@ export class CacheService {
       const staleAt = Date.now() + ttlMs;
       this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt);
 
-      if (!this._redisDisabled) {
+      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
         try {
           const client = await this.getRedis();
           const s      = JSON.stringify(data);
@@ -619,7 +655,15 @@ export class CacheService {
       }
       this.logger.debug('SWR: revalidation complete', { cacheKey });
     } catch (err) {
-      this.logger.debug('SWR: revalidation failed', { cacheKey, error: (err as Error).message });
+      if (this.opts.staleIfError > 0) {
+        const additionalMs = this.opts.staleIfError * 1_000;
+        this.l1.bumpExpiry(cacheKey, additionalMs);
+        this.logger.debug('SWR: revalidation failed, stale-if-error extending expiry', {
+          cacheKey, staleIfErrorSecs: this.opts.staleIfError,
+        });
+      } else {
+        this.logger.debug('SWR: revalidation failed', { cacheKey, error: (err as Error).message });
+      }
     } finally {
       this.revalidating.delete(cacheKey);
     }
@@ -628,14 +672,36 @@ export class CacheService {
   // ── Explicit set / delete ─────────────────────────────────────────────────
 
   /** Explicitly write a value into L1 (+ L2 in production). */
-  async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority): Promise<void> {
+  async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[] }): Promise<void> {
     const ttlMs = ttlSeconds * 1_000;
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
     this.l1.set(k, data, ttlMs, p);
 
-    if (!this._redisDisabled) {
+    // Register tags in the in-process index (+ Redis SADD)
+    if (opts?.tags?.length) {
+      for (const tag of opts.tags) {
+        const tagKey = this.nk(`_tag_:${tag}`);
+        let members = this.tagIndex.get(tagKey);
+        if (!members) { members = new Set(); this.tagIndex.set(tagKey, members); }
+        members.add(k);
+      }
+      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+        try {
+          const client = await this.getRedis();
+          const pl = client.pipeline();
+          for (const tag of opts.tags) {
+            const tagKey = this.nk(`_tag_:${tag}`);
+            pl.sadd(tagKey, k);
+            pl.expire(tagKey, ttlSeconds + 3_600); // keep tag set alive longer than entries
+          }
+          await pl.exec();
+        } catch { /* tags are best-effort */ }
+      }
+    }
+
+    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
       try {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
@@ -668,7 +734,7 @@ export class CacheService {
       this.disk.delete(k);
     }
 
-    if (!this._redisDisabled) {
+    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
       try {
         const client = await this.getRedis();
         if (isPattern) {
@@ -698,8 +764,20 @@ export class CacheService {
    * Returns 0 if Redis is disabled (safe fallback — rate limiting won't block in dev).
    */
   async increment(cacheKey: string, ttlSeconds?: number): Promise<number> {
-    if (this._redisDisabled) return 0;
     const k = this.nk(cacheKey);
+
+    if (this._redisDisabled) {
+      const now   = Date.now();
+      const ttlMs = (ttlSeconds ?? 60) * 1_000;
+      const entry = this._l1Counters.get(k);
+      if (entry && entry.expiresAt > now) {
+        entry.value++;
+        return entry.value;
+      }
+      this._l1Counters.set(k, { value: 1, expiresAt: now + ttlMs });
+      return 1;
+    }
+
     try {
       const client = await this.getRedis();
       const count  = await client.incr(k);
@@ -711,7 +789,256 @@ export class CacheService {
     }
   }
 
-  // ── Stats ─────────────────────────────────────────────────────────────────
+  // ── Clear / Rebalance / TTL ────────────────────────────────────────────────
+
+  /**
+   * Flush all cached entries, or only those whose key starts with `prefix`.
+   *
+   * @example
+   * await cache.clear();           // flush everything
+   * await cache.clear('user:abc'); // flush all keys for one user
+   */
+  async clear(prefix?: string): Promise<void> {
+    this.counters.deletes++;
+    const k = prefix
+      ? this.nk(prefix.includes('*') ? prefix : `${prefix}*`)
+      : undefined;
+
+    if (k) {
+      this.l1.deletePattern(k);
+      // Disk-tier pattern delete is not supported (files are keyed by SHA-256 hash);
+      // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
+    } else {
+      this.l1.clear();
+      this.disk.clear();
+      this._l1Counters.clear();
+      this.tagIndex.clear();
+    }
+
+    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+      try {
+        const client  = await this.getRedis();
+        const pattern = k ?? (this._namespace ? `${this._namespace}:*` : '*');
+        const stream  = client.scanStream({ match: pattern, count: 100 });
+        const keys: string[] = [];
+        await new Promise<void>((resolve, reject) => {
+          stream.on('data',  (chunk: string[]) => keys.push(...chunk));
+          stream.on('end',   resolve);
+          stream.on('error', reject);
+        });
+        if (keys.length > 0) await client.del(...keys);
+      } catch (err) {
+        this.logger.debug('clear: Redis unavailable', { error: (err as Error).message });
+      }
+    }
+
+    void this.publishInvalidation('del-glob',
+      k ?? (this._namespace ? `${this._namespace}:*` : '*'));
+  }
+
+  /**
+   * Evict L1 entries that violate the current category or global capacity limits.
+   * Useful after a write burst or after adding stricter `categoryLimits`.
+   * Returns the number of entries evicted.
+   */
+  rebalance(): number {
+    return this.l1.rebalance();
+  }
+
+  /**
+   * Return the remaining TTL in seconds for a key currently in L1.
+   * Returns null if the key is absent from L1 or has already expired.
+   * Only reflects L1 state — does not query Redis or disk.
+   */
+  ttl(cacheKey: string): number | null {
+    return this.l1.ttl(this.nk(cacheKey));
+  }
+
+  /**
+   * Return true if the key exists in L1 and has not expired.
+   * Bloom-filter fast path — no fetch, no disk or Redis round-trip.
+   */
+  has(cacheKey: string): boolean {
+    return this.l1.has(this.nk(cacheKey));
+  }
+
+  /**
+   * Extend the TTL of a key in L1 (and fire-and-forget EXPIRE in Redis) without fetching.
+   * Returns `false` if the key is absent or already expired.
+   *
+   * @param newTtlSeconds - The new TTL from now, in seconds.
+   */
+  async touch(cacheKey: string, newTtlSeconds: number): Promise<boolean> {
+    const k   = this.nk(cacheKey);
+    const hit = this.l1.touch(k, newTtlSeconds * 1_000);
+    if (hit && !this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        void client.expire(k, newTtlSeconds); // fire-and-forget
+      } catch { /* ok */ }
+    }
+    return hit;
+  }
+
+  /**
+   * Return the cached value from L1 **only if it is fresh** (not in the SWR grace window).
+   * Returns `null` when the key is absent, expired, or stale — without triggering a fetch.
+   *
+   * @example
+   * const fresh = cache.getIfFresh('user:123');
+   * if (fresh !== null) return fresh; // serve from L1, no network hop
+   */
+  getIfFresh<T = unknown>(cacheKey: string): T | null {
+    const k     = this.nk(cacheKey);
+    const entry = this.l1.getEntry(k);
+    if (!entry) return null;
+    const now = Date.now();
+    if (entry.expiresAt <= now) return null;               // expired
+    if (entry.staleAt !== undefined && entry.staleAt < now) return null; // in SWR grace
+    return (entry.value !== undefined ? entry.value : unpack(entry.data)) as T;
+  }
+
+  /**
+   * Batch get — fetches multiple keys, using L1 where hot and calling `fetchFn` for misses.
+   * Preserves input ordering. Uses inflight coalescing per key.
+   *
+   * @param keys    - Array of cache keys.
+   * @param fetchFn - Called with only the keys that missed L1.
+   * @param ttl     - TTL in seconds for newly fetched values.
+   */
+  async mget<T>(
+    keys: string[],
+    fetchFn: (missKeys: string[]) => Promise<Record<string, T>>,
+    ttl = 300,
+    priority?: CachePriority,
+  ): Promise<(T | undefined)[]> {
+    const result: (T | undefined)[] = new Array(keys.length);
+    const missIndexes: number[] = [];
+    const missKeys:   string[]  = [];
+
+    for (let i = 0; i < keys.length; i++) {
+      const entry = this.l1.getEntry(this.nk(keys[i]));
+      if (entry && entry.expiresAt > Date.now()) {
+        result[i] = (entry.value !== undefined ? entry.value : unpack(entry.data)) as T;
+        this.counters.l1Hits++;
+      } else {
+        missIndexes.push(i);
+        missKeys.push(keys[i]);
+      }
+    }
+
+    if (missKeys.length > 0) {
+      const fetched = await fetchFn(missKeys);
+      for (let j = 0; j < missKeys.length; j++) {
+        const v = fetched[missKeys[j]];
+        result[missIndexes[j]] = v;
+        if (v !== undefined) {
+          await this.set(missKeys[j], v, ttl, priority);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Invalidate all keys associated with a tag.
+   * Deletes from L1, disk, and Redis (both the keyed values and the tag set).
+   *
+   * @example
+   * await cache.set('product:1', data, 60, undefined, { tags: ['catalog'] });
+   * await cache.invalidateTag('catalog'); // clears product:1 and any other tagged entries
+   */
+  async invalidateTag(tag: string): Promise<void> {
+    const tagKey  = this.nk(`_tag_:${tag}`);
+    const members = this.tagIndex.get(tagKey) ?? new Set<string>();
+
+    // Remove from L1 + disk
+    for (const k of members) {
+      this.l1.delete(k);
+      this.disk.delete(k);
+    }
+    this.tagIndex.delete(tagKey);
+
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        const redisMembers: string[] = await client.smembers(tagKey);
+        const toDelete = [...new Set([...members, ...redisMembers])];
+        if (toDelete.length > 0) {
+          await client.del(...toDelete, tagKey);
+        } else {
+          await client.del(tagKey);
+        }
+      } catch (err) {
+        this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+      }
+    }
+  }
+
+  /**
+   * Measure L1 / disk / Redis latency.
+   * Useful for health checks and dashboards.
+   *
+   * @returns `{ l1, disk, l2 }` latencies in milliseconds.
+   *          `l2` is `null` when Redis is disabled.
+   */
+  async ping(): Promise<CachePingResult> {
+    // L1: measure a has() call
+    const t0 = Date.now();
+    this.l1.has('__ping__');
+    const l1 = Date.now() - t0;
+
+    // Disk: measure a stats access
+    const t1 = Date.now();
+    void this.disk.stats;
+    const disk = Date.now() - t1;
+
+    // L2: PING command
+    let l2: number | null = null;
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        const t2 = Date.now();
+        await client.ping();
+        l2 = Date.now() - t2;
+      } catch { l2 = null; }
+    }
+
+    return { l1, disk, l2 };
+  }
+
+  /**
+   * Export all live L1 entries to Redis via a single pipeline.
+   * Useful for warming a new Redis instance or for zero-downtime failover.
+   * Returns the number of keys written.
+   */
+  async drainToL2(): Promise<number> {
+    if (this._redisDisabled) return 0;
+    try {
+      const client  = await this.getRedis();
+      const entries = this.l1.exportEntries([]);
+      const now     = Date.now();
+      if (entries.length === 0) return 0;
+
+      const pl = client.pipeline();
+      for (const { key, entry } of entries) {
+        const remainingMs = entry.expiresAt - now;
+        if (remainingMs <= 0) continue;
+        const ttlSecs = Math.max(1, Math.ceil(remainingMs / 1_000));
+        const s       = JSON.stringify(entry.value);
+        const stored  = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+        pl.setex(key, ttlSecs, stored);
+      }
+      await pl.exec();
+      return entries.length;
+    } catch (err) {
+      this.logger.debug('drainToL2: Redis unavailable', { error: (err as Error).message });
+      return 0;
+    }
+  }
+
+  // ── Stats ─────────────────────────────────────────────────────────────
 
   stats() {
     return {
@@ -790,8 +1117,11 @@ export class CacheService {
    * @param m      - Snapshot returned by `cache.metrics()`
    * @param prefix - Metric name prefix. Default: `"tricache"`
    */
-  static toPrometheusText(m: CacheMetrics, prefix = 'tricache'): string {
-    const lbl  = m.namespace ? `{namespace="${m.namespace}"}` : '';
+  static toPrometheusText(m: CacheMetrics, prefix = 'tricache', instanceName?: string): string {
+    const parts: string[] = [];
+    if (m.namespace) parts.push(`namespace="${m.namespace}"`);
+    if (instanceName) parts.push(`instance="${instanceName}"`);
+    const lbl  = parts.length ? `{${parts.join(',')}}` : '';
     const lines: string[] = [];
 
     const counter = (name: string, val: number, help: string) => {

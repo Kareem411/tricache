@@ -73,6 +73,8 @@ const IV_POOL_COUNT = 64;
 export class CacheEncryption {
   private _key: Buffer | null = null;
   private readonly _mode: EncryptionMode;
+  private _prevKey:  Buffer | null = null;
+  private _prevMode: EncryptionMode = 'aes-256-gcm';
 
   // Pre-allocated GCM IV pool — 12-byte IVs (96-bit, NIST recommended).
   private readonly _ivPool = Buffer.allocUnsafe(IV_BYTES * IV_POOL_COUNT);
@@ -150,7 +152,13 @@ export class CacheEncryption {
     return out;
   }
 
-  constructor(keyBase64: string | undefined, logger: ILogger, mode: EncryptionMode = 'aes-256-gcm') {
+  constructor(
+    keyBase64: string | undefined,
+    logger: ILogger,
+    mode: EncryptionMode = 'aes-256-gcm',
+    previousKeyBase64?: string,
+    previousMode?: EncryptionMode,
+  ) {
     this._mode = mode;
     if (!keyBase64) {
       if (process.env.NODE_ENV === 'production') {
@@ -180,6 +188,16 @@ export class CacheEncryption {
       }
     } catch (err) {
       logger.error('Invalid encryption key — falling back to plaintext', {}, err as Error);
+    }
+
+    if (previousKeyBase64) {
+      try {
+        this._prevMode = previousMode ?? mode;
+        this._prevKey  = Buffer.from(previousKeyBase64, 'base64');
+        logger.debug('Previous encryption key loaded for key rotation fallback');
+      } catch (err) {
+        logger.warn('Invalid previousEncryptionKey — rotation fallback disabled', { error: (err as Error).message });
+      }
     }
   }
 
@@ -225,20 +243,39 @@ export class CacheEncryption {
   /**
    * Decrypt a Redis value.
    * Auto-detects the envelope prefix; returns plaintext unchanged if no prefix matches.
+   * Falls back to `previousEncryptionKey` when the primary key fails (key rotation).
    */
   decrypt(value: string): string {
+    try {
+      return this._decryptWithKey(value, this._key, this._mode);
+    } catch (primaryErr) {
+      if (this._prevKey) {
+        try {
+          return this._decryptWithKey(value, this._prevKey, this._prevMode);
+        } catch { /* ignore — fall through to re-throw primary */ }
+      }
+      throw primaryErr;
+    }
+  }
+
+  private _decryptWithKey(value: string, key: Buffer | null, mode: EncryptionMode): string {
     if (value.startsWith(PREFIX_XOR)) {
-      if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
+      if (!key) throw new Error('Cannot decrypt: encryption key is not set');
       // WARNING: XOR is NOT cryptographic — obfuscation only.
       const masked = Buffer.from(value.slice(PREFIX_XOR.length), 'base64');
-      return this._xorBuffer(masked).toString('utf8');
+      // XOR is self-inverse; use the provided key regardless of mode
+      const klen = key.length;
+      const len  = masked.length;
+      const out  = Buffer.allocUnsafe(len);
+      for (let i = 0; i < len; i++) out[i] = masked[i] ^ key[i % klen];
+      return out.toString('utf8');
     }
     if (value.startsWith(PREFIX_CTR)) {
-      if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
+      if (!key) throw new Error('Cannot decrypt: encryption key is not set');
       const combined = Buffer.from(value.slice(PREFIX_CTR.length), 'base64');
       const iv = combined.subarray(0, CTR_IV_BYTES);
       const ct = combined.subarray(CTR_IV_BYTES);
-      const d  = createDecipheriv('aes-128-ctr', this._key, iv);
+      const d  = createDecipheriv('aes-128-ctr', key, iv);
       const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
       d.final();
       return plain.toString('utf8');
@@ -246,18 +283,19 @@ export class CacheEncryption {
     const is256 = value.startsWith(PREFIX_256);
     const is128 = value.startsWith(PREFIX_128);
     if (!is256 && !is128) return value;
-    if (!this._key) throw new Error('Cannot decrypt: encryption key is not set');
+    if (!key) throw new Error('Cannot decrypt: encryption key is not set');
     const prefix = is128 ? PREFIX_128 : PREFIX_256;
     const algo   = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
     const combined = Buffer.from(value.slice(prefix.length), 'base64');
     const iv  = combined.subarray(0, IV_BYTES);
     const tag = combined.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const ct  = combined.subarray(IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(algo, this._key, iv);
+    const d   = createDecipheriv(algo, key, iv);
     d.setAuthTag(tag);
     const plain = d.update(ct);  // GCM: final() emits no bytes
     d.final();                   // verifies auth tag — throws on tamper
     return plain.toString('utf8');
+    void mode; // mode is used implicitly via prefix detection
   }
 
   // ── Buffer (disk / snapshot) ──────────────────────────────────────────────
@@ -303,22 +341,40 @@ export class CacheEncryption {
   /**
    * Decrypt a raw Buffer from disk/snapshot.
    * Auto-detects the magic header; returns the original buffer if no magic matches (legacy/unencrypted).
+   * Falls back to `previousEncryptionKey` when the primary key fails (key rotation).
    */
   decryptBuffer(data: Buffer): Buffer {
+    try {
+      return this._decryptBufferWithKey(data, this._key);
+    } catch (primaryErr) {
+      if (this._prevKey) {
+        try {
+          return this._decryptBufferWithKey(data, this._prevKey);
+        } catch { /* ignore — re-throw primary */ }
+      }
+      throw primaryErr;
+    }
+  }
+
+  private _decryptBufferWithKey(data: Buffer, key: Buffer | null): Buffer {
     if (data.length < MAGIC_LEN) return data;
     const magic = data.subarray(0, MAGIC_LEN);
 
     if (magic.equals(MAGIC_XOR)) {
-      if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+      if (!key) throw new Error('Cannot decrypt buffer: encryption key is not set');
       // WARNING: XOR is NOT cryptographic — obfuscation only.
-      return this._xorBuffer(data.subarray(MAGIC_LEN));
+      const raw  = data.subarray(MAGIC_LEN);
+      const klen = key.length;
+      const out  = Buffer.allocUnsafe(raw.length);
+      for (let i = 0; i < raw.length; i++) out[i] = raw[i] ^ key[i % klen];
+      return out;
     }
 
     if (magic.equals(MAGIC_CTR)) {
-      if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+      if (!key) throw new Error('Cannot decrypt buffer: encryption key is not set');
       const iv = data.subarray(MAGIC_LEN, MAGIC_LEN + CTR_IV_BYTES);
       const ct = data.subarray(MAGIC_LEN + CTR_IV_BYTES);
-      const d  = createDecipheriv('aes-128-ctr', this._key, iv);
+      const d  = createDecipheriv('aes-128-ctr', key, iv);
       const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
       d.final();
       return plain;
@@ -326,12 +382,12 @@ export class CacheEncryption {
     const is256 = magic.equals(MAGIC_256);
     const is128 = magic.equals(MAGIC_128);
     if (!is256 && !is128) return data;
-    if (!this._key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+    if (!key) throw new Error('Cannot decrypt buffer: encryption key is not set');
     const algo = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
     const iv  = data.subarray(MAGIC_LEN, MAGIC_LEN + IV_BYTES);
     const tag = data.subarray(MAGIC_LEN + IV_BYTES, MAGIC_LEN + IV_BYTES + TAG_BYTES);
     const ct  = data.subarray(MAGIC_LEN + IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(algo, this._key, iv);
+    const d   = createDecipheriv(algo, key, iv);
     d.setAuthTag(tag);
     const plain = d.update(ct);  // GCM: final() emits no bytes
     d.final();                   // verifies auth tag — throws on tamper

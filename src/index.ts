@@ -33,4 +33,6 @@ export {
   type SmartCacheEntry,
   type DiskCacheEntry,
   type CacheHit,
+  type EvictionReason,
+  type CachePingResult,
 } from './types';
