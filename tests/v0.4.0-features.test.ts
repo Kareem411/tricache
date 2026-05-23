@@ -236,9 +236,12 @@ describe('XFetch probabilistic early expiration (xfetchBeta)', () => {
 
     await new Promise<void>(r => setTimeout(r, 80));
 
-    // Hit twice rapidly — only one background revalidation should be scheduled
-    await svc.get('xf:once', async () => { fetchCount++; return 'v2'; }, 0.12, { xfetchBeta: 1e6 });
-    await svc.get('xf:once', async () => { fetchCount++; return 'v2'; }, 0.12, { xfetchBeta: 1e6 });
+    // Hit twice rapidly — only one background revalidation should be scheduled.
+    // fetchFn uses a small setTimeout so the revalidation stays in-flight across
+    // both gets (prevents it completing in microtasks between the two awaits).
+    const slowFetch = async () => { await new Promise<void>(r => setTimeout(r, 30)); fetchCount++; return 'v2'; };
+    await svc.get('xf:once', slowFetch, 0.12, { xfetchBeta: 1e6 });
+    await svc.get('xf:once', slowFetch, 0.12, { xfetchBeta: 1e6 });
 
     expect(svc.metrics().revalidations.total).toBeLessThanOrEqual(1);
 

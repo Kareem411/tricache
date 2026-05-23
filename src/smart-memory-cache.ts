@@ -133,36 +133,38 @@ class CountMinSketch {
     return h;
   }
 
-  /** Four independent bit-mixes from one FNV-1a seed. */
-  private hashes(key: string): [number, number, number, number] {
-    const h = this.fnv32(key);
-    const h1 = (h ^ (h >>> 16)) >>> 0;
-    const h2 = (Math.imul(h1, 0x45d9f3b) ^ (h1 >>> 16)) >>> 0;
-    const h3 = (Math.imul(h2, 0x7fb9b7a1) ^ (h2 >>> 16)) >>> 0;
-    const h4 = (Math.imul(h3, 0x1b873593) ^ (h3 >>> 16)) >>> 0;
-    return [h1, h2, h3, h4];
-  }
-
   /** Record one access. Decays all counters when the insertion threshold is crossed. */
   increment(key: string): void {
-    const [h1, h2, h3, h4] = this.hashes(key);
-    const t = this.table;
-    t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)] = Math.min(0xffff, (t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)] + 1));
-    t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)] = Math.min(0xffff, (t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)] + 1));
-    t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)] = Math.min(0xffff, (t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)] + 1));
-    t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)] = Math.min(0xffff, (t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)] + 1));
+    const h  = this.fnv32(key);
+    const h1 = (h  ^ (h  >>> 16)) >>> 0;
+    const h2 = (Math.imul(h1, 0x45d9f3b)  ^ (h1 >>> 16)) >>> 0;
+    const h3 = (Math.imul(h2, 0x7fb9b7a1) ^ (h2 >>> 16)) >>> 0;
+    const h4 = (Math.imul(h3, 0x1b873593) ^ (h3 >>> 16)) >>> 0;
+    const t  = this.table;
+    const i0 = h1 & SKETCH_MASK;
+    const i1 = SKETCH_WIDTH       + (h2 & SKETCH_MASK);
+    const i2 = 2 * SKETCH_WIDTH   + (h3 & SKETCH_MASK);
+    const i3 = 3 * SKETCH_WIDTH   + (h4 & SKETCH_MASK);
+    if (t[i0] < 0xffff) t[i0]++;
+    if (t[i1] < 0xffff) t[i1]++;
+    if (t[i2] < 0xffff) t[i2]++;
+    if (t[i3] < 0xffff) t[i3]++;
     if (++this.inserts >= SKETCH_DECAY_THRESHOLD) this.decay();
   }
 
   /** Minimum-across-rows frequency estimate. */
   estimate(key: string): number {
-    const [h1, h2, h3, h4] = this.hashes(key);
-    const t = this.table;
+    const h  = this.fnv32(key);
+    const h1 = (h  ^ (h  >>> 16)) >>> 0;
+    const h2 = (Math.imul(h1, 0x45d9f3b)  ^ (h1 >>> 16)) >>> 0;
+    const h3 = (Math.imul(h2, 0x7fb9b7a1) ^ (h2 >>> 16)) >>> 0;
+    const h4 = (Math.imul(h3, 0x1b873593) ^ (h3 >>> 16)) >>> 0;
+    const t  = this.table;
     return Math.min(
-      t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)],
-      t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)],
-      t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)],
-      t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)],
+      t[h1 & SKETCH_MASK],
+      t[SKETCH_WIDTH       + (h2 & SKETCH_MASK)],
+      t[2 * SKETCH_WIDTH   + (h3 & SKETCH_MASK)],
+      t[3 * SKETCH_WIDTH   + (h4 & SKETCH_MASK)],
     );
   }
 
@@ -384,9 +386,8 @@ export class SmartMemoryCache {
     if (entry.expiresAt < now) { this._delete(key, 'ttl'); return null; }
     entry.hits++;
     entry.lastAccess = now;
-    this.sketch.increment(key);
-    const cat = this.getCategory(key);
-    this.categoryHits.set(cat, (this.categoryHits.get(cat) ?? 0) + 1);
+    // Sample sketch at 25 % — eviction scoring only needs relative frequency, not exact counts.
+    if ((entry.hits & 3) === 0) this.sketch.increment(key);
     // value is cached at write time — hot reads return the live object directly,
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
     const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
