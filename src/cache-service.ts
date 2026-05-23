@@ -33,6 +33,8 @@ import {
   CacheMetrics,
   CachePingResult,
   ILogger,
+  ICacheTracer,
+  ICacheSpan,
   consoleLogger,
 } from './types';
 import { CacheEncryption }   from './encryption';
@@ -54,6 +56,57 @@ const DEFAULT_CATEGORY_LIMITS: Record<string, CategoryLimit> = {
 // ─── Default forbidden prefixes ───────────────────────────────────────────────
 
 const DEFAULT_FORBIDDEN_PREFIXES = ['auth:', 'session:', 'mfa:', 'rate_limit:'] as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Circuit breaker — three-state (CLOSED → OPEN → HALF_OPEN) for L2 Redis
+// ─────────────────────────────────────────────────────────────────────────────
+
+const enum CBState { CLOSED, OPEN, HALF_OPEN }
+
+class L2CircuitBreaker {
+  private state      = CBState.CLOSED;
+  private failures   = 0;
+  private openedAt   = 0;
+  constructor(
+    private readonly threshold:  number,
+    private readonly cooldownMs: number,
+  ) {}
+
+  /** Call before each Redis attempt. Returns false when the circuit is open. */
+  isAllowed(): boolean {
+    if (this.state === CBState.CLOSED)    return true;
+    if (this.state === CBState.HALF_OPEN) return true; // one probe allowed
+    // OPEN: check if cooldown elapsed
+    if (Date.now() - this.openedAt >= this.cooldownMs) {
+      this.state = CBState.HALF_OPEN;
+      return true; // probe
+    }
+    return false;
+  }
+
+  /** Call on Redis success. */
+  onSuccess(): void {
+    this.failures = 0;
+    this.state    = CBState.CLOSED;
+  }
+
+  /** Call on Redis failure. */
+  onFailure(): void {
+    this.failures++;
+    if (this.state === CBState.HALF_OPEN || this.failures >= this.threshold) {
+      this.state    = CBState.OPEN;
+      this.openedAt = Date.now();
+      this.failures = 0;
+    }
+  }
+
+  get isOpen(): boolean { return this.state === CBState.OPEN; }
+  get currentState(): 'closed' | 'open' | 'half_open' {
+    return this.state === CBState.CLOSED ? 'closed'
+         : this.state === CBState.OPEN   ? 'open'
+         :                                 'half_open';
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Priority inference — override by passing priority explicitly to get()
@@ -94,6 +147,8 @@ export class CacheService {
     staleIfError: number;
     l2WriteMode: 'read-write' | 'read-only';
     instanceName: string;
+    ttlJitterFactor: number;
+    tracer: ICacheTracer | undefined;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -106,6 +161,7 @@ export class CacheService {
   private readonly tagIndex    = new Map<string, Set<string>>();
   private redis:               RedisClient | null = null;
   private redisConnecting:     Promise<RedisClient> | null = null;
+  private readonly cb:         L2CircuitBreaker;
   private snapshotLoaded       = false;
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
@@ -190,7 +246,14 @@ export class CacheService {
       staleIfError:             options.staleIfError       ?? 0,
       l2WriteMode:              options.l2WriteMode        ?? 'read-write',
       instanceName:             options.instanceName       ?? '',
+      ttlJitterFactor:          Math.min(Math.max(options.ttlJitterFactor ?? 0, 0), 1),
+      tracer:                   options.tracer,
     };
+
+    // Circuit breaker for L2 Redis
+    const cbThreshold  = options.l2CircuitBreakerThreshold  ?? 5;
+    const cbCooldownMs = options.l2CircuitBreakerCooldownMs ?? 30_000;
+    this.cb = new L2CircuitBreaker(cbThreshold, cbCooldownMs);
 
     // L1.5 disk tier
     this.disk = new DiskTier({
@@ -328,6 +391,19 @@ export class CacheService {
     return this._namespace ? `${this._namespace}:${key}` : key;
   }
 
+  /** Apply TTL jitter: multiply ttlMs by (1 ± jitterFactor). */
+  private _jitterTtl(ttlMs: number): number {
+    const j = this.opts.ttlJitterFactor;
+    if (j === 0) return ttlMs;
+    return Math.round(ttlMs * (1 + (Math.random() * 2 - 1) * j));
+  }
+
+  /** Start an OTEL-compatible span if a tracer is configured. Returns a no-op span otherwise. */
+  private _startSpan(name: string): ICacheSpan {
+    if (this.opts.tracer) return this.opts.tracer.startSpan(name);
+    return { setAttribute() { return this; }, setStatus() { return this; }, end() {} };
+  }
+
   private initBackplane(): void {
     if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     if (this.subClient) return;
@@ -401,7 +477,7 @@ export class CacheService {
   }
 
   private async getRedis(): Promise<RedisClient> {
-    if (this.redis?.status === 'ready') return this.redis as RedisClient;
+    if (!this.cb.isAllowed()) throw new Error('tricache: L2 circuit breaker is open');
     if (this.redisConnecting) return this.redisConnecting;
 
     this.redisConnecting = (async () => {
@@ -429,10 +505,12 @@ export class CacheService {
           setTimeout(() => reject(new Error('Redis connection timeout')), 15_000);
         });
 
+        this.cb.onSuccess();
         this.redis = client;
         this.redisConnecting = null;
         return client;
       } catch (err) {
+        this.cb.onFailure();
         this.redisConnecting = null; // allow retry on next call — fixes the cached-rejection bug
         throw err;
       }
@@ -538,11 +616,12 @@ export class CacheService {
       swr?:      number; // Stale-While-Revalidate grace period in seconds
     } = {},
   ): Promise<T> {
+    const span = this._startSpan('tricache.get');
+    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const k = this.nk(cacheKey); // namespaced key used for all storage
     this.counters.gets++;
 
-    // L1: in-memory (fastest path — defer inferPriority / ttlMs until we confirm a miss;
-    // inferPriority runs 3 regex tests that are wasted work on every warm hit)
+    // L1: in-memory (fastest path)
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
       if (l1Hit.isStale) {
@@ -560,27 +639,31 @@ export class CacheService {
         this.logger.debug('L1 hit');
       }
       this.counters.l1Hits++;
+      span.setAttribute('cache.hit', 'l1').end();
       return l1Hit.value as T;
     }
 
-    const ttlMs      = ttlSeconds * 1_000;
+    const ttlMs      = this._jitterTtl(ttlSeconds * 1_000);
     const swrGraceMs = (opts.swr ?? 0) * 1_000;
-    const priority   = opts.priority ?? inferPriority(cacheKey); // original key for correct prefix inference
+    const priority   = opts.priority ?? inferPriority(cacheKey);
 
     // L2: Redis (distributed, production-only by default)
     if (!this._redisDisabled) {
       try {
         const client = await this.getRedis();
         const raw    = await client.get(k);
+        this.cb.onSuccess();
         if (raw) {
           const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
           const parsed    = JSON.parse(decrypted) as T;
           this.l1.set(k, parsed, ttlMs, priority);
           this.counters.l2Hits++;
           this.logger.debug('L2 hit (Redis)', { cacheKey });
+          span.setAttribute('cache.hit', 'l2').end();
           return parsed;
         }
       } catch (err) {
+        this.cb.onFailure();
         this.logger.debug('Redis unavailable, continuing to fetch', { cacheKey, error: (err as Error).message });
       }
     }
@@ -597,16 +680,20 @@ export class CacheService {
         if (l1Check !== null) {
           this.counters.diskHits++;
           this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
+          span.setAttribute('cache.hit', 'disk').end();
           return l1Check.value as T;
         }
       }
     }
+
+    span.setAttribute('cache.hit', 'miss');
 
     // Cache MISS: thundering-herd prevention
     const existing = this.inflight.get(k);
     if (existing) {
       this.counters.stampedes++;
       this.logger.debug('Stampede prevented — coalescing onto inflight fetch', { cacheKey });
+      span.end();
       return existing as Promise<T>;
     }
 
@@ -624,9 +711,11 @@ export class CacheService {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
             const toStore    = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
-            await client.setex(k, ttlSeconds, toStore);
+            await client.setex(k, Math.ceil(ttlMs / 1_000), toStore);
+            this.cb.onSuccess();
             this.logger.debug('Cached L1+L2', { cacheKey, ttlSeconds, encrypted: this.enc.isEnabled });
           } catch {
+            this.cb.onFailure();
             this.logger.debug('Cached L1 only (Redis unavailable)', { cacheKey });
           }
         } else {
@@ -636,6 +725,7 @@ export class CacheService {
         return data;
       } finally {
         this.inflight.delete(k);
+        span.end();
       }
     })();
 
@@ -683,7 +773,9 @@ export class CacheService {
 
   /** Explicitly write a value into L1 (+ L2 in production). */
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[] }): Promise<void> {
-    const ttlMs = ttlSeconds * 1_000;
+    const span  = this._startSpan('tricache.set');
+    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
+    const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
@@ -704,10 +796,11 @@ export class CacheService {
           for (const tag of opts.tags) {
             const tagKey = this.nk(`_tag_:${tag}`);
             pl.sadd(tagKey, k);
-            pl.expire(tagKey, ttlSeconds + 3_600); // keep tag set alive longer than entries
+            pl.expire(tagKey, ttlSeconds + 3_600);
           }
           await pl.exec();
-        } catch { /* tags are best-effort */ }
+          this.cb.onSuccess();
+        } catch { this.cb.onFailure(); /* tags are best-effort */ }
       }
     }
 
@@ -716,13 +809,16 @@ export class CacheService {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
         const stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
-        await client.setex(k, ttlSeconds, stored);
+        await client.setex(k, Math.ceil(ttlMs / 1_000), stored);
+        this.cb.onSuccess();
       } catch (err) {
+        this.cb.onFailure();
         this.logger.debug('set: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
     }
 
     void this.publishInvalidation('del', k);
+    span.end();
   }
 
   /**
@@ -733,8 +829,10 @@ export class CacheService {
    * await cache.delete('user:abc:*');              // all keys for user abc
    */
   async delete(cacheKey: string): Promise<void> {
+    const span      = this._startSpan('tricache.delete');
+    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const isPattern = cacheKey.includes('*');
-    const k         = this.nk(cacheKey); // namespace-scoped key / pattern
+    const k         = this.nk(cacheKey);
     this.counters.deletes++;
 
     if (isPattern) {
@@ -759,12 +857,15 @@ export class CacheService {
         } else {
           await client.del(k);
         }
+        this.cb.onSuccess();
       } catch (err) {
+        this.cb.onFailure();
         this.logger.debug('delete: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
     }
 
     void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k);
+    span.end();
   }
 
   // ── Counter (distributed rate limiting) ──────────────────────────────────
@@ -994,6 +1095,103 @@ export class CacheService {
   }
 
   /**
+   * Batch write — set multiple entries in a single call.
+   * TTL jitter is applied per-entry when `ttlJitterFactor` > 0.
+   *
+   * @example
+   * await cache.mset({
+   *   'user:1': { value: { name: 'Alice' }, ttl: 300 },
+   *   'user:2': { value: { name: 'Bob'   }, ttl: 300, priority: CachePriority.HIGH },
+   * });
+   */
+  async mset<T = unknown>(
+    entries: Record<string, { value: T; ttl?: number; priority?: CachePriority; tags?: string[] }>,
+  ): Promise<void> {
+    const keys = Object.keys(entries);
+    await Promise.all(keys.map(key => {
+      const { value, ttl = 300, priority, tags } = entries[key];
+      return this.set(key, value, ttl, priority, tags ? { tags } : undefined);
+    }));
+  }
+
+  /**
+   * Batch delete — delete multiple exact keys in a single call.
+   * Glob patterns are not supported; use `delete('prefix:*')` for patterns.
+   *
+   * @example
+   * await cache.mdel(['user:1', 'user:2', 'user:3']);
+   */
+  async mdel(keys: string[]): Promise<void> {
+    await Promise.all(keys.map(k => this.delete(k)));
+  }
+
+  /**
+   * Warm L1 from L2 (Redis) by scanning for keys matching a glob pattern and
+   * pulling them into L1. Useful on startup to eliminate cold-start penalty when
+   * the local snapshot is unavailable or too stale.
+   *
+   * Returns the number of keys loaded into L1.
+   *
+   * @example
+   * // In your startup hook (e.g. ECS task, k8s readiness probe):
+   * const loaded = await cache.warmFromL2('org:*');
+   * console.log(`Warmed ${loaded} keys from Redis`);
+   */
+  async warmFromL2(pattern: string): Promise<number> {
+    if (this._redisDisabled) return 0;
+    try {
+      const client  = await this.getRedis();
+      const nsPattern = this.nk(pattern);
+
+      // Collect all matching keys via SCAN
+      const matchedKeys: string[] = [];
+      const stream = client.scanStream({ match: nsPattern, count: 100 });
+      await new Promise<void>((resolve, reject) => {
+        stream.on('data',  (chunk: string[]) => matchedKeys.push(...chunk));
+        stream.on('end',   resolve);
+        stream.on('error', reject);
+      });
+
+      if (matchedKeys.length === 0) {
+        this.cb.onSuccess();
+        return 0;
+      }
+
+      // Fetch values in a pipeline and load into L1
+      const pl = client.pipeline();
+      for (const k of matchedKeys) pl.get(k);
+      const results = await pl.exec() as Array<[Error | null, string | null]>;
+      this.cb.onSuccess();
+
+      let loaded = 0;
+      const now = Date.now();
+      for (let i = 0; i < matchedKeys.length; i++) {
+        const [err, raw] = results[i];
+        if (err || raw == null) continue;
+        try {
+          const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
+          const parsed    = JSON.parse(decrypted) as unknown;
+          // Use a 10-minute TTL as a reasonable default; the real TTL is not
+          // returned by GET (use PTTL to be precise, but that doubles round-trips).
+          const remainingMs = 10 * 60 * 1_000;
+          this.l1.set(matchedKeys[i], parsed, remainingMs, inferPriority(matchedKeys[i]));
+          loaded++;
+        } catch { /* skip malformed entries */ }
+      }
+      void now; // suppress unused warning
+
+      this.logger.info('warmFromL2 complete', {
+        pattern, matched: matchedKeys.length, loaded,
+      });
+      return loaded;
+    } catch (err) {
+      this.cb.onFailure();
+      this.logger.debug('warmFromL2: Redis unavailable', { error: (err as Error).message });
+      return 0;
+    }
+  }
+
+  /**
    * Invalidate all keys associated with a tag.
    * Deletes from L1, disk, and Redis (both the keyed values and the tag set).
    *
@@ -1145,6 +1343,10 @@ export class CacheService {
         sent:     c.invSent,
         received: c.invReceived,
         skipped:  c.invSkipped,
+      },
+
+      l2CircuitBreaker: {
+        state: this.cb.currentState,
       },
 
       oom: {

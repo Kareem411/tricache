@@ -4,6 +4,25 @@
 
 // ─── Logger ─────────────────────────────────────────────────────────────────
 
+// ─── OpenTelemetry tracer interface ──────────────────────────────────────────
+
+/**
+ * Minimal span interface — structurally compatible with `@opentelemetry/api` Span.
+ * Pass your existing OTEL tracer; no extra package required.
+ */
+export interface ICacheSpan {
+  setAttribute(key: string, value: string | number | boolean): this;
+  setStatus(status: { code: 0 | 1 | 2; message?: string }): this;
+  end(): void;
+}
+
+/**
+ * Minimal tracer interface — structurally compatible with `@opentelemetry/api` Tracer.
+ */
+export interface ICacheTracer {
+  startSpan(name: string): ICacheSpan;
+}
+
 /** Minimal logger interface — plug in any logger (pino, winston, console, etc.) */
 export interface ILogger {
   debug(msg: string, meta?: Record<string, unknown>): void;
@@ -170,6 +189,12 @@ export interface CacheMetrics {
     received: number;
     /** Own messages silently skipped (prevents double-eviction) */
     skipped:  number;
+  };
+
+  /** L2 Redis circuit breaker state */
+  l2CircuitBreaker: {
+    /** `'closed'` = normal; `'open'` = Redis paused; `'half_open'` = probing recovery */
+    state: 'closed' | 'open' | 'half_open';
   };
 
   /** OOM guard statistics */
@@ -388,4 +413,44 @@ export interface CacheOptions {
   onMetrics?: (metrics: CacheMetrics) => void;
   /** How often the `onMetrics` callback fires (ms). Default: 60 000 ms */
   metricsIntervalMs?: number;
+
+  /**
+   * OpenTelemetry-compatible tracer. When provided, `get()`, `set()`, and
+   * `delete()` are each wrapped in a span with attributes:
+   * - `cache.hit`         — `'l1' | 'disk' | 'l2' | 'miss'`
+   * - `cache.key_prefix`  — first path segment of the key (e.g. `'user'`)
+   *
+   * Pass your existing `@opentelemetry/api` Tracer directly — no extra
+   * dependency required; the interface is structurally compatible.
+   *
+   * @example
+   * import { trace } from '@opentelemetry/api';
+   * tracer: trace.getTracer('tricache')
+   */
+  tracer?: ICacheTracer;
+
+  // ── TTL jitter ─────────────────────────────────────────────────────────────
+  /**
+   * Randomise every stored TTL by ± `ttlJitterFactor × ttl` seconds.
+   * Prevents thundering-herd cache stampedes when thousands of entries share
+   * the same TTL and expire simultaneously.
+   *
+   * A factor of `0.15` spreads a 300 s TTL uniformly over [255 s, 345 s].
+   * Default: `0` (disabled — TTLs are stored exactly as given).
+   */
+  ttlJitterFactor?: number;
+
+  // ── L2 circuit breaker ─────────────────────────────────────────────────────
+  /**
+   * Number of consecutive Redis errors before the circuit opens (stops
+   * attempting Redis until the cooldown elapses).
+   * Default: `5`.
+   */
+  l2CircuitBreakerThreshold?: number;
+  /**
+   * Milliseconds the circuit stays open before transitioning to half-open
+   * (allows a single probe request to test recovery).
+   * Default: `30 000` ms (30 s).
+   */
+  l2CircuitBreakerCooldownMs?: number;
 }

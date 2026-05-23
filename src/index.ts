@@ -35,4 +35,6 @@ export {
   type CacheHit,
   type EvictionReason,
   type CachePingResult,
+  type ICacheTracer,
+  type ICacheSpan,
 } from './types';
