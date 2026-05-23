@@ -45,7 +45,7 @@ jobs:
     name: Publish to npm + GitHub Release
     needs: test
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: false # disabled — publish manually via pnpm publish
     permissions:
       contents: write
       id-token: write
