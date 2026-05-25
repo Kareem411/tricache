@@ -48,6 +48,9 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 | **XFetch probabilistic early expiry** | Probabilistic background recompute keyed to last fetch duration and `xfetchBeta` — optimal protection against expiry spikes under load |
 | **`hotKeys(n)`** | Returns top N keys by Count-Min Sketch access frequency with size — no full Map scan |
 | **`dependsOn` cascade invalidation** | Tag entries with parent keys; deleting a parent automatically evicts all declared dependents from L1 |
+| **`onHit` / `onMiss` callbacks** | Per-operation hit/miss hooks with tier info (`'l1'` \| `'disk'` \| `'l2'`) — no wait for the metrics interval |
+| **`frozen` mode** | Dev-time mutation guard — `Object.freeze()` applied recursively to every L1 hit so accidental mutations throw immediately |
+| **`tags` in `get()` opts** | Attach tags at read time; when `fetchFn` populates the entry on a miss the tags are registered automatically |
 
 ---
 
@@ -262,6 +265,20 @@ CacheService.create({
   // ── Metrics callback ─────────────────────────────────────────────────
   metricsIntervalMs: 60_000,                       // emit every 60 s (default)
   onMetrics: (m) => myMonitoring.record(m),        // optional push callback
+
+  // ── Per-operation hooks ───────────────────────────────────────────────
+  // onHit fires on every L1, disk, or L2 hit with the caller-facing key (no prefix)
+  // and the tier that served it. Lower latency than waiting for onMetrics.
+  onHit:  (key, tier) => cloudwatch.putMetricData({ key, tier }),
+
+  // onMiss fires when all three tiers are exhausted — before fetchFn is called.
+  onMiss: (key) => cloudwatch.putMetricData({ key }),
+
+  // ── Development mutation guard ────────────────────────────────────────
+  // When true, every L1 hit value is deep-frozen before being returned.
+  // Mutation attempts throw TypeError immediately in development.
+  // Do NOT enable in production — deep-freezing large objects has measurable overhead.
+  frozen: process.env.NODE_ENV !== 'production',
 });
 ```
 
@@ -309,6 +326,7 @@ Get from cache or call `fetchFn` on a miss. The inflight map ensures `fetchFn` f
 | `opts.refreshAhead` | `number` | — | Fraction `(0, 1]` of TTL — triggers background recompute when `remaining ≤ ttl × (1 - refreshAhead)` |
 | `opts.xfetchBeta` | `number` | — | XFetch β ≥ 0 — scales probabilistic early recompute by last fetch duration; higher = recompute earlier |
 | `opts.notFoundTtl` | `number` | — | Per-call TTL in seconds for `null`/`undefined` results (overrides global `notFoundTtl`) |
+| `opts.tags` | `string[]` | — | Tags to register when `fetchFn` populates the entry on a miss; no-op on L1/L2 hits where tags are already registered |
 
 ### `cache.set<T>(key, data, ttlSeconds?, priority?, opts?)` → `Promise<void>`
 

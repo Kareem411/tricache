@@ -863,3 +863,107 @@ describe('CacheEncryption previousEncryptionKey', () => {
     expect(newEnc.decryptBuffer(cipherBuf).toString()).toBe('buffer data');
   });
 });
+
+// ─── CTR mode: multi-byte character integrity ─────────────────────────────────
+
+describe('CacheEncryption aes-128-ctr — multi-byte character integrity', () => {
+  const silentLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+  // 16-byte key (deterministic — not for production use)
+  const key16 = Buffer.alloc(16, 0x61).toString('base64'); // 16 × 'a'
+
+  let enc: CacheEncryption;
+  beforeEach(() => {
+    enc = new CacheEncryption(key16, silentLogger, 'aes-128-ctr');
+  });
+
+  it('encrypt/decrypt round-trips a 4-byte emoji at every byte offset 0–63 without replacement characters', () => {
+    // 🎴 (U+1F004) encodes to 4 UTF-8 bytes: F0 9F 80 84.
+    // Varying the prefix length shifts the emoji across every possible alignment
+    // within the 16-byte AES block, exercising the update()/final() boundary.
+    const emoji = '\u{1F004}';
+    for (let i = 0; i < 64; i++) {
+      const plaintext = 'A'.repeat(i) + emoji + 'B'.repeat(i);
+      const encrypted = enc.encrypt(plaintext);
+      const decrypted = enc.decrypt(encrypted);
+      expect(decrypted, `round-trip failed at i=${i}`).toBe(plaintext);
+      expect(decrypted, `replacement char at i=${i}`).not.toContain('\uFFFD');
+    }
+  });
+
+  it('encryptBuffer/decryptBuffer round-trips a 4-byte emoji at every byte offset 0–63 without replacement characters', () => {
+    const emoji = '\u{1F004}';
+    for (let i = 0; i < 64; i++) {
+      const plaintext = 'A'.repeat(i) + emoji + 'B'.repeat(i);
+      const buf       = Buffer.from(plaintext, 'utf8');
+      const encrypted = enc.encryptBuffer(buf);
+      const decrypted = enc.decryptBuffer(encrypted).toString('utf8');
+      expect(decrypted, `buffer round-trip failed at i=${i}`).toBe(plaintext);
+      expect(decrypted, `buffer replacement char at i=${i}`).not.toContain('\uFFFD');
+    }
+  });
+});
+
+// ─── tags option on cache.get() ───────────────────────────────────────────────
+
+describe('tags option on cache.get()', () => {
+  let svc: CacheService;
+  let diskDir: string;
+  beforeEach(() => ({ svc, diskDir } = makeService()));
+  afterEach(async () => {
+    await svc.destroy();
+    try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('registers the tag on a cache miss so invalidateTag() removes the entry', async () => {
+    await svc.get('case:1', () => Promise.resolve({ id: 1 }), 300, { tags: ['cases'] });
+    expect(svc.has('case:1')).toBe(true);
+
+    await svc.invalidateTag('cases');
+    expect(svc.has('case:1')).toBe(false);
+  });
+
+  it('multiple tags on a single get() — any one invalidates the entry', async () => {
+    await svc.get('ai:1', () => Promise.resolve('result'), 300, {
+      tags: ['ai-chat', 'tenant:org1'],
+    });
+
+    await svc.invalidateTag('ai-chat');
+    expect(svc.has('ai:1')).toBe(false);
+  });
+
+  it('second tag also invalidates (both registered)', async () => {
+    await svc.get('ai:2', () => Promise.resolve('result'), 300, {
+      tags: ['ai-chat', 'tenant:org2'],
+    });
+
+    await svc.invalidateTag('tenant:org2');
+    expect(svc.has('ai:2')).toBe(false);
+  });
+
+  it('tags on get() and tags on set() use the same index — invalidateTag() covers both', async () => {
+    await svc.set('p:set', 'via-set', 300, undefined, { tags: ['catalog'] });
+    await svc.get('p:get', () => Promise.resolve('via-get'), 300, { tags: ['catalog'] });
+
+    await svc.invalidateTag('catalog');
+
+    expect(svc.has('p:set')).toBe(false);
+    expect(svc.has('p:get')).toBe(false);
+  });
+
+  it('tags field is a no-op on an L1 hit — does not throw, entry survives', async () => {
+    // Populate first (no tags)
+    await svc.set('hit:1', 'val', 300);
+    // L1 hit — tags should be ignored silently
+    const result = await svc.get('hit:1', () => Promise.resolve('miss'), 300, {
+      tags: ['ignored-on-hit'],
+    });
+    expect(result).toBe('val');
+    expect(svc.has('hit:1')).toBe(true);
+  });
+
+  it('get() without tags works identically to before (backward compat)', async () => {
+    const result = await svc.get('compat:1', () => Promise.resolve(42), 300);
+    expect(result).toBe(42);
+    expect(svc.has('compat:1')).toBe(true);
+  });
+});

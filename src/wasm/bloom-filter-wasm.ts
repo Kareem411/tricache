@@ -38,11 +38,7 @@ interface BloomWasmExports {
   countBits(): number;
 }
 
-function instantiateSync(): WebAssembly.Instance {
-  const wasmBytes = Buffer.from(BLOOM_WASM_BASE64, 'base64');
-  const compiled = new WebAssembly.Module(wasmBytes);
-  return new WebAssembly.Instance(compiled, {});
-}
+const BLOOM_WASM_MODULE = new WebAssembly.Module(Buffer.from(BLOOM_WASM_BASE64, 'base64'));
 
 export class WasmBloomFilter {
   private readonly exports: BloomWasmExports;
@@ -55,7 +51,7 @@ export class WasmBloomFilter {
   private _insertionCount = 0;
 
   constructor() {
-    const instance = instantiateSync();
+    const instance = new WebAssembly.Instance(BLOOM_WASM_MODULE, {});
     this.exports = instance.exports as unknown as BloomWasmExports;
     this.mem = new Uint8Array(this.exports.memory.buffer);
     const k = 7, p = 0.01;
@@ -63,21 +59,9 @@ export class WasmBloomFilter {
   }
 
   private writeKey(key: string): number {
-    const max = Math.min(key.length, MAX_KEY_BYTES);
-    if (max === 0) return 0;
-    // Fast path: write ASCII bytes directly, skipping TextEncoder heap allocation.
-    // On the first non-ASCII char, fall back to TextEncoder for correct multi-byte encoding.
-    for (let i = 0; i < max; i++) {
-      const c = key.charCodeAt(i);
-      if (c > 127) {
-        const encoded = this.encoder.encode(key);
-        const len = Math.min(encoded.length, MAX_KEY_BYTES);
-        this.mem.set(encoded.subarray(0, len), KEY_STAGING_OFFSET);
-        return len;
-      }
-      this.mem[KEY_STAGING_OFFSET + i] = c;
-    }
-    return max;
+    if (key.length === 0) return 0;
+    const target = this.mem.subarray(KEY_STAGING_OFFSET, KEY_STAGING_OFFSET + MAX_KEY_BYTES);
+    return this.encoder.encodeInto(key, target).written;
   }
 
   add(key: string): void {

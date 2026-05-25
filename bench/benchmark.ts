@@ -1015,6 +1015,156 @@ console.log(
 );
 note('If overhead > 10%: check that l1.getEntry() is inlined by V8 at this call site.');
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  14. Amortized disk janitor — purgeNextBucket vs purgeExpired
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Amortized disk janitor — purgeNextBucket() vs purgeExpired()');
+note('purgeExpired() walks ALL files synchronously: readdirSync × 2 levels + statSync +');
+note('readFileSync + decrypt + unpack + unlinkSync per expired file. O(fileCount) burst.');
+note('purgeNextBucket() does the same work but for ONE of 256 subdirectory buckets.');
+note('30 s × 256 buckets = 128-min full cycle. Each tick is O(fileCount / 256) on average.');
+note('Both require full decrypt+unpack — expiresAt lives inside the AES-256-GCM ciphertext.');
+
+{
+  const janitorDir = makeTempDir();
+  const janitorDisk = (await import('../src/disk-tier.js')).DiskTier
+    ? new (await import('../src/disk-tier.js')).DiskTier({
+        dir: janitorDir,
+        maxBytes: 50 * 1024 * 1024,
+        entryMaxBytes: 1024 * 1024,
+        forbiddenPrefixes: [],
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      })
+    : null;
+
+  // Import DiskTier directly (already imported at top via CacheService internals — use a clean instance)
+  const { DiskTier: DT } = await import('../src/disk-tier.js');
+  const jDisk = new DT({
+    dir: janitorDir,
+    maxBytes: 50 * 1024 * 1024,
+    entryMaxBytes: 1024 * 1024,
+    forbiddenPrefixes: [],
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+  });
+
+  // Seed 200 long-lived entries spread across buckets
+  const { pack: jPack } = await import('msgpackr');
+  const { CachePriority: jCP } = await import('../src/types.js');
+  for (let i = 0; i < 200; i++) {
+    const data = jPack({ n: i });
+    await jDisk.save(`bench:janitor:${i}`, {
+      data,
+      isCompressed: true,
+      expiresAt: Date.now() + 300_000,
+      size: data.byteLength,
+      hits: 1,
+      lastAccess: Date.now(),
+      priority: jCP.NORMAL,
+    });
+  }
+
+  console.log(`  ${C.dim}  Seeded ${jDisk.stats.files} live entries across disk buckets${C.reset}`);
+
+  // Measure purgeNextBucket (one-bucket tick, no entries expire → cost is readdirSync only)
+  await bench('purgeNextBucket() — one bucket tick (no expiry)', () => {
+    jDisk.purgeNextBucket();
+  }, 10_000, 256, 'readdirSync one bucket + stat+read+decrypt per file in that bucket');
+
+  // Measure purgeExpired full scan (none expire → cost is full walk)
+  await bench('purgeExpired()   — full 256-bucket scan (no expiry)', () => {
+    jDisk.purgeExpired();
+  }, 500, 5, 'readdirSync all buckets + stat+read+decrypt every file (O(fileCount))');
+
+  console.log(`  ${C.dim}  Ratio: purgeNextBucket is 1/256th of the full scan work per call.${C.reset}`);
+  console.log(`  ${C.dim}  At equal interval, janitor spreads the same total I/O across 256 ticks.${C.reset}`);
+
+  try { rmSync(janitorDir, { recursive: true, force: true }); } catch { /* ok */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  15. categoryKeys trailing-wildcard fast path vs O(N) regex scan
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('deletePattern — categoryKeys O(1) fast path vs O(N) regex scan');
+note('When the trailing-wildcard pattern prefix exactly matches a configured category,');
+note('deletePattern() looks up the pre-built categoryKeys Set instead of scanning the Map.');
+note('Fast path: O(catSize) key iteration only. Slow path: O(N) regex test per key.');
+note('Speedup is proportional to N / catSize — most pronounced when N is large.');
+
+{
+  const CAT_ENTRIES = 2_000;
+  const CAT_SIZE    = 200;  // user: category holds 200 keys
+
+  // Cache with 'user:' as an explicit category — fast path fires on deletePattern('user:*')
+  const fpCache = new SmartMemoryCache({
+    maxBytes:   100 * 1024 * 1024,
+    maxEntries: CAT_ENTRIES,
+    categories: {
+      'user:':    { maxEntries: CAT_SIZE, maxSizeBytes: 10 * 1024 * 1024 },
+      'default':  { maxEntries: CAT_ENTRIES - CAT_SIZE, maxSizeBytes: 90 * 1024 * 1024 },
+    },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+  });
+
+  // Fill 200 user: entries + 1800 default entries
+  for (let i = 0; i < CAT_SIZE;                i++) fpCache.set(`user:${i}`,    { id: i }, 300_000);
+  for (let i = 0; i < CAT_ENTRIES - CAT_SIZE;  i++) fpCache.set(`default:${i}`, { id: i }, 300_000);
+
+  // Cache WITHOUT 'user:' as a category — forces the O(N) regex scan for same pattern
+  const regexCache = new SmartMemoryCache({
+    maxBytes:   100 * 1024 * 1024,
+    maxEntries: CAT_ENTRIES,
+    categories: { 'default': { maxEntries: CAT_ENTRIES, maxSizeBytes: 100 * 1024 * 1024 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+  });
+  for (let i = 0; i < CAT_SIZE;                i++) regexCache.set(`user:${i}`,    { id: i }, 300_000);
+  for (let i = 0; i < CAT_ENTRIES - CAT_SIZE;  i++) regexCache.set(`default:${i}`, { id: i }, 300_000);
+
+  // Warmup both paths equally
+  for (let r = 0; r < 5; r++) {
+    for (let i = 0; i < CAT_SIZE; i++) fpCache.set(`user:${i}`, { id: i }, 300_000);
+    fpCache.deletePattern('user:*');
+    for (let i = 0; i < CAT_SIZE; i++) regexCache.set(`user:${i}`, { id: i }, 300_000);
+    regexCache.deletePattern('user:*');
+  }
+
+  // Re-seed for timed runs (each bench iteration deletes+reseeds to keep the measurement honest)
+  let fpIdx = 0;
+  const fpRun = (): void => {
+    // Reseed the category so each deletePattern has entries to delete
+    for (let i = 0; i < CAT_SIZE; i++) fpCache.set(`user:${fpIdx * CAT_SIZE + i}`, { id: i }, 300_000);
+    fpIdx++;
+    fpCache.deletePattern('user:*');
+  };
+
+  let rxIdx = 0;
+  const rxRun = (): void => {
+    for (let i = 0; i < CAT_SIZE; i++) regexCache.set(`user:${rxIdx * CAT_SIZE + i}`, { id: i }, 300_000);
+    rxIdx++;
+    regexCache.deletePattern('user:*');
+  };
+
+  const fpRes = await bench(
+    `deletePattern('user:*') — categoryKeys fast path (${CAT_ENTRIES} entries, cat=${CAT_SIZE})`,
+    fpRun, 2_000, 20,
+    'O(catSize) index lookup + Set iteration — skips full Map scan',
+  );
+
+  const rxRes = await bench(
+    `deletePattern('user:*') — O(N) regex scan   (${CAT_ENTRIES} entries, cat=${CAT_SIZE})`,
+    rxRun, 2_000, 20,
+    'O(N) Map.keys() iteration + RegExp.test per key',
+  );
+
+  const speedup = rxRes.nsPerOp / fpRes.nsPerOp;
+  const colour  = speedup >= 2 ? C.green : speedup >= 1.2 ? C.yellow : C.red;
+  console.log(
+    `  ${C.dim}  Fast-path speedup: ${colour}${speedup.toFixed(2)}×${C.reset}${C.dim} ` +
+    `(${CAT_SIZE} cat keys vs ${CAT_ENTRIES} total — expect ≈ ${(CAT_ENTRIES / CAT_SIZE).toFixed(0)}× theoretical)${C.reset}`
+  );
+}
+
 divider();
 const fm = svc.metrics();
 console.log(`\n${C.bold}  Final cache state${C.reset}`);
@@ -1167,6 +1317,116 @@ note('L1 populated with 500 entries. Measures full-scan generator throughput vs 
   );
 
   await iterSvc.destroy();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  16. WasmBloomFilter — writeKey hot-path micro-benchmarks
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('WasmBloomFilter — writeKey encodeInto hot-path');
+note('WASM module compiled once at module load; each new WasmBloomFilter() is an instantiation only.');
+note('writeKey now uses TextEncoder.encodeInto() — zero heap allocation per call.');
+note('All key pools are pre-allocated so string construction is not on the hot path.');
+
+{
+  const { WasmBloomFilter } = await import('../src/wasm/bloom-filter-wasm.js');
+
+  // ── Instantiation cost ──────────────────────────────────────────────────
+  // Module-level BLOOM_WASM_MODULE means instantiation is near-instant.
+  // Each iteration creates a fresh instance to measure the real per-instantiation cost.
+  await bench(
+    'WasmBloomFilter — new instance (module pre-compiled)',
+    () => { new WasmBloomFilter(); },
+    1_000, 100,
+    'new WebAssembly.Instance(BLOOM_WASM_MODULE) — no recompile',
+  );
+
+  const wf = new WasmBloomFilter();
+
+  // ── Short ASCII keys ────────────────────────────────────────────────────
+  // Pre-allocate a pool of 4096 keys (power of 2 for mask trick).
+  // These are typical cache keys: short, ASCII-only, no allocation on hot path.
+  const asciiPool = Array.from({ length: 4_096 }, (_, i) => `user_session:${i.toString(16).padStart(6, '0')}`);
+  const ASCII_MASK = asciiPool.length - 1;
+
+  // Warm encodeInto's JIT path before measuring
+  for (let i = 0; i < 500; i++) wf.mightContain(asciiPool[i & ASCII_MASK]);
+
+  await bench(
+    'mightContain — short ASCII key (≤ 20 chars)',
+    i => { wf.mightContain(asciiPool[i & ASCII_MASK]); },
+    500_000, 5_000,
+    'encodeInto → WASM memory → 7 hash rounds → bit check',
+  );
+
+  await bench(
+    'add — short ASCII key (≤ 20 chars)',
+    i => { wf.add(asciiPool[i & ASCII_MASK]); },
+    500_000, 5_000,
+    'encodeInto → WASM memory → 7 hash rounds → bit set',
+  );
+
+  // ── Long ASCII keys (> 64 chars) ────────────────────────────────────────
+  // encodeInto's native C++ implementation outpaces a JS element-by-element
+  // loop for longer keys — this verifies the crossover is beneficial.
+  const longAsciiPool = Array.from({ length: 2_048 }, (_, i) =>
+    `namespace:tenant_${i}:resource:v2:${('a'.repeat(48))}:${i}`
+  );
+  const LONG_ASCII_MASK = longAsciiPool.length - 1;
+
+  for (let i = 0; i < 500; i++) wf.mightContain(longAsciiPool[i & LONG_ASCII_MASK]);
+
+  await bench(
+    'mightContain — long ASCII key (≈ 80 chars)',
+    i => { wf.mightContain(longAsciiPool[i & LONG_ASCII_MASK]); },
+    500_000, 5_000,
+    'encodeInto at native speed; 1 byte/char, capped at 512B',
+  );
+
+  // ── Multi-byte UTF-8 keys ───────────────────────────────────────────────
+  // Pre-allocate a pool of UTF-8 strings that previously triggered encode()
+  // allocation on every call. With encodeInto, these are now zero-allocation.
+  const mbPool = Array.from({ length: 2_048 }, (_, i) =>
+    `キャッシュ_session_${i}_🎴_пользователь`
+  );
+  const MB_MASK = mbPool.length - 1;
+
+  for (let i = 0; i < 500; i++) wf.mightContain(mbPool[i & MB_MASK]);
+
+  await bench(
+    'mightContain — multi-byte UTF-8 key (Kanji+emoji+Cyrillic)',
+    i => { wf.mightContain(mbPool[i & MB_MASK]); },
+    100_000, 1_000,
+    'encodeInto zero-alloc; was encode() heap-alloc on every call',
+  );
+
+  // ── Long multi-byte key near the 512-byte boundary ──────────────────────
+  // This was the worst-case for the old encode() path: full string encoded to
+  // ~3× the output size, then sliced. encodeInto stops exactly at the boundary.
+  const longMbKey = '日本語キャッシュシステム_'.repeat(18); // ~540 UTF-8 bytes → truncated at 512
+  for (let i = 0; i < 500; i++) wf.mightContain(longMbKey);
+
+  await bench(
+    'mightContain — long multi-byte key (> 512B UTF-8, truncated)',
+    () => { wf.mightContain(longMbKey); },
+    100_000, 1_000,
+    'encodeInto fills exactly 512B; old encode() allocated ~1620B buffer',
+  );
+
+  // ── Surrogate-pair boundary safety ─────────────────────────────────────
+  // 510 ASCII + 4-byte emoji: encodeInto writes 510 bytes and skips the emoji
+  // rather than writing a partial 4-byte sequence. Confirm no crash + throughput.
+  const emojiAtBoundary = 'A'.repeat(510) + '🌟'.repeat(10);
+  for (let i = 0; i < 200; i++) wf.mightContain(emojiAtBoundary);
+
+  await bench(
+    'mightContain — emoji straddling 512B boundary (surrogate-safe)',
+    () => { wf.mightContain(emojiAtBoundary); },
+    100_000, 1_000,
+    'encodeInto skips partial surrogate; writes 510B cleanly',
+  );
+
+  wf.reset();
 }
 
 await svc.destroy();

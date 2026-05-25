@@ -100,4 +100,55 @@ describe('DiskTier', () => {
     expect(disk.stats.files).toBe(2);
     expect(disk.stats.maxKB).toBeGreaterThan(0);
   });
+
+  // ── purgeNextBucket (staggered disk janitor) ─────────────────────────────
+
+  describe('purgeNextBucket', () => {
+    it('advances bucket pointer and wraps at 256', () => {
+      for (let i = 0; i < 257; i++) disk.purgeNextBucket();
+      // After 257 calls the pointer wraps once and lands on 1
+      expect((disk as any)._nextJanitorBucket).toBe(1);
+    });
+
+    it('removes expired entries across a full 256-bucket cycle', async () => {
+      await disk.save('expire-me', makeEntry('gone',  1));        // 1 ms TTL
+      await disk.save('keep-me',   makeEntry('here',  60_000));  // 60s TTL
+      expect(disk.stats.files).toBe(2);
+
+      await new Promise(r => setTimeout(r, 30)); // let TTL expire
+
+      let purged = 0;
+      for (let i = 0; i < 256; i++) purged += disk.purgeNextBucket();
+
+      expect(purged).toBe(1);
+      expect(disk.stats.files).toBe(1);
+      // live entry is still accessible
+      expect(disk.load('keep-me')).not.toBeNull();
+    });
+
+    it('does not remove live entries', async () => {
+      await disk.save('live1', makeEntry('a', 60_000));
+      await disk.save('live2', makeEntry('b', 60_000));
+
+      let purged = 0;
+      for (let i = 0; i < 256; i++) purged += disk.purgeNextBucket();
+
+      expect(purged).toBe(0);
+      expect(disk.stats.files).toBe(2);
+    });
+
+    it('keeps fileCount and diskUsageBytes consistent after purge', async () => {
+      await disk.save('exp', makeEntry('x', 1));
+      await new Promise(r => setTimeout(r, 30));
+      for (let i = 0; i < 256; i++) disk.purgeNextBucket();
+      expect(disk.stats.files).toBe(0);
+      expect(disk.stats.sizeKB).toBe(0);
+    });
+
+    it('returns 0 on an empty or non-existent bucket', () => {
+      // No files saved — every bucket directory is absent
+      const result = disk.purgeNextBucket();
+      expect(result).toBe(0);
+    });
+  });
 });

@@ -319,6 +319,57 @@ describe('Iterator interface (keys / values / entries)', () => {
   });
 });
 
+// ── Feature: scan() ───────────────────────────────────────────────────────────
+
+describe('CacheService.scan()', () => {
+  it('visits all live entries with correct values', async () => {
+    await svc.set('a', 10, 60);
+    await svc.set('b', 20, 60);
+    const collected: [string, number][] = [];
+    svc.scan<number>((rawKey, value, offset) => {
+      collected.push([rawKey.slice(offset), value]);
+    });
+    collected.sort(([a], [b]) => a.localeCompare(b));
+    expect(collected).toEqual([['a', 10], ['b', 20]]);
+  });
+
+  it('strips namespace via offset (no extra slice on caller side)', async () => {
+    const nsSvc = CacheService.reset({
+      disableRedis: true,
+      namespace:    'myns',
+      l1MaxEntries: 100,
+      l1MaxBytes:   10 * 1024 * 1024,
+      diskCacheDir: tempDir(),
+    });
+    try {
+      await nsSvc.set('foo', 'bar', 60);
+      const seen: [string, string][] = [];
+      nsSvc.scan<string>((rawKey, value, offset) => {
+        seen.push([rawKey.slice(offset), value]);
+      });
+      expect(seen).toEqual([['foo', 'bar']]);
+    } finally {
+      await nsSvc.destroy();
+    }
+  });
+
+  it('skips expired entries', async () => {
+    await svc.set('live', 'yes', 60);
+    await svc.set('dead', 'no', 0.001);
+    await new Promise(r => setTimeout(r, 20));
+    const keys: string[] = [];
+    svc.scan((rawKey, _v, offset) => keys.push(rawKey.slice(offset)));
+    expect(keys).toContain('live');
+    expect(keys).not.toContain('dead');
+  });
+
+  it('visits nothing when cache is empty', () => {
+    let count = 0;
+    svc.scan(() => count++);
+    expect(count).toBe(0);
+  });
+});
+
 // ── Feature: Invalidation backplane message handler ───────────────────────────
 
 describe('Invalidation backplane (_handleBackplaneMessage)', () => {
@@ -388,5 +439,131 @@ describe('Invalidation backplane (_handleBackplaneMessage)', () => {
     // after yielding to the event loop it fires
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(diskSpy).toHaveBeenCalledWith('k');
+  });
+});
+
+// ── Feature: onHit / onMiss callbacks ────────────────────────────────────────
+
+describe('onHit / onMiss callbacks', () => {
+  it('onHit fires with tier "l1" on an L1 cache hit', async () => {
+    const hits: Array<{ key: string; tier: string }> = [];
+    const dir = tempDir();
+    const s = CacheService.reset({
+      disableRedis: true, diskCacheDir: dir,
+      onHit: (key, tier) => hits.push({ key, tier }),
+    });
+    try {
+      await s.set('org:1', { name: 'acme' }, 60);
+      await s.get('org:1', () => Promise.resolve({ name: 'miss' }), 60);
+      expect(hits).toHaveLength(1);
+      expect(hits[0]).toEqual({ key: 'org:1', tier: 'l1' });
+    } finally { await s.destroy(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('onMiss fires on a cache miss', async () => {
+    const misses: string[] = [];
+    const dir = tempDir();
+    const s = CacheService.reset({
+      disableRedis: true, diskCacheDir: dir,
+      onMiss: (key) => misses.push(key),
+    });
+    try {
+      await s.get('cold:1', () => Promise.resolve('val'), 60);
+      expect(misses).toEqual(['cold:1']);
+    } finally { await s.destroy(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('neither callback fires when not configured', async () => {
+    // Should not throw even with no onHit/onMiss
+    const result = await svc.get('plain:1', () => Promise.resolve(42), 60);
+    expect(result).toBe(42);
+  });
+});
+
+// ── Feature: frozen option ────────────────────────────────────────────────────
+
+describe('frozen option', () => {
+  it('returned L1 hit is deeply frozen when frozen: true', async () => {
+    const dir = tempDir();
+    const s = CacheService.reset({ disableRedis: true, diskCacheDir: dir, frozen: true });
+    try {
+      await s.set('obj:1', { a: { b: 1 } }, 60);
+      const val = await s.get<{ a: { b: number } }>('obj:1', () => Promise.resolve({ a: { b: 0 } }), 60);
+      expect(Object.isFrozen(val)).toBe(true);
+      expect(Object.isFrozen(val.a)).toBe(true);
+      expect(() => { (val as { a: { b: number } }).a.b = 99; }).toThrow(TypeError);
+    } finally { await s.destroy(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('returned value is NOT frozen when frozen is not set', async () => {
+    await svc.set('mutable:1', { x: 1 }, 60);
+    const val = await svc.get<{ x: number }>('mutable:1', () => Promise.resolve({ x: 0 }), 60);
+    expect(Object.isFrozen(val)).toBe(false);
+    val.x = 999; // should not throw
+    expect(val.x).toBe(999);
+  });
+});
+
+// ── Feature: warmFromL2 priority override ─────────────────────────────────────
+
+describe('warmFromL2 priority option', () => {
+  it('accepts a priority option without error when Redis is disabled', async () => {
+    const { CachePriority } = await import('../src/types');
+    // Redis disabled → warmFromL2 returns 0 but must not throw
+    const result = await svc.warmFromL2('org:*', { priority: CachePriority.HIGH });
+    expect(result).toBe(0);
+  });
+});
+
+// ── Feature: invalidateTags() batch ──────────────────────────────────────────
+
+describe('invalidateTags() batch invalidation', () => {
+  it('removes all entries tagged with any of the given tags in one call', async () => {
+    await svc.set('case:1', 'c', 60, undefined, { tags: ['case:acme'] });
+    await svc.set('org:1',  'o', 60, undefined, { tags: ['org:acme'] });
+    await svc.set('ai:1',   'a', 60, undefined, { tags: ['ai-chat:acme'] });
+    await svc.set('other:1', 'x', 60, undefined, { tags: ['unrelated'] });
+
+    await svc.invalidateTags(['case:acme', 'org:acme', 'ai-chat:acme']);
+
+    expect(svc.has('case:1')).toBe(false);
+    expect(svc.has('org:1')).toBe(false);
+    expect(svc.has('ai:1')).toBe(false);
+    expect(svc.has('other:1')).toBe(true); // unrelated tag — must survive
+  });
+
+  it('is equivalent to calling invalidateTag() for each tag individually', async () => {
+    const dir1 = tempDir(); const dir2 = tempDir();
+    const s1 = CacheService.reset({ disableRedis: true, diskCacheDir: dir1 });
+    const s2 = CacheService.reset({ disableRedis: true, diskCacheDir: dir2 });
+    try {
+      for (const s of [s1, s2]) {
+        await s.set('p:1', 'v', 60, undefined, { tags: ['alpha'] });
+        await s.set('p:2', 'v', 60, undefined, { tags: ['beta'] });
+        await s.set('p:3', 'v', 60, undefined, { tags: ['gamma'] });
+      }
+      await s1.invalidateTags(['alpha', 'beta', 'gamma']);
+      await s2.invalidateTag('alpha');
+      await s2.invalidateTag('beta');
+      await s2.invalidateTag('gamma');
+
+      expect(s1.has('p:1')).toBe(s2.has('p:1'));
+      expect(s1.has('p:2')).toBe(s2.has('p:2'));
+      expect(s1.has('p:3')).toBe(s2.has('p:3'));
+    } finally {
+      await s1.destroy(); await s2.destroy();
+      rmSync(dir1, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true });
+    }
+  });
+
+  it('is a no-op for an empty tags array', async () => {
+    await expect(svc.invalidateTags([])).resolves.not.toThrow();
+  });
+
+  it('with a single tag delegates to invalidateTag() — same result', async () => {
+    await svc.set('solo:1', 'v', 60, undefined, { tags: ['solo-tag'] });
+    await svc.invalidateTags(['solo-tag']);
+    expect(svc.has('solo:1')).toBe(false);
   });
 });

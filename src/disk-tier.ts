@@ -24,7 +24,17 @@ import { DiskCacheEntry, ILogger } from './types.js';
 const AES_ALGO  = 'aes-256-gcm' as const;
 const IV_BYTES  = 12;
 const TAG_BYTES = 16;
-const DISK_MAGIC = Buffer.from([0x44, 0x54, 0x49, 0x45, 0x52, 0x56, 0x31, 0x00]); // "DTIERV1\0"
+const DISK_MAGIC    = Buffer.from([0x44, 0x54, 0x49, 0x45, 0x52, 0x56, 0x31, 0x00]); // "DTIERV1\0"
+/**
+ * V2 file format — expiresAt stored in plaintext outside the ciphertext so the
+ * janitor can check expiry with a 16-byte header read rather than a full
+ * decrypt + unpack.  Layout (bytes):
+ *   0–7   DISK_MAGIC_V2 ("DTIERV2\0")
+ *   8–15  expiresAt, uint64 LE (ms since epoch, outside encryption)
+ *  16+    encryptV2(msgpack(DiskPayload)) — IV+TAG+ct if key set, else raw msgpack
+ */
+const DISK_MAGIC_V2 = Buffer.from([0x44, 0x54, 0x49, 0x45, 0x52, 0x56, 0x32, 0x00]); // "DTIERV2\0"
+const V2_HEADER_LEN = 16; // magic(8) + expiresAt(8)
 
 interface DiskPayload {
   version:   number;
@@ -52,6 +62,8 @@ export class DiskTier {
   private diskUsageBytes    = 0;
   private usageCounted      = false;
   private fileCount         = 0;   // maintained in-memory; avoids walkCacheFiles() in stats
+  /** Next bucket index (0–255) for the staggered janitor wheel. */
+  private _nextJanitorBucket = 0;
 
   constructor(opts: DiskTierOptions) {
     this.opts = opts;
@@ -85,18 +97,49 @@ export class DiskTier {
   }
 
   /**
-   * Map a cache key to its on-disk path.
-   *
-   * Files are sharded into two-character hex prefix subdirectories to avoid
-   * putting thousands of flat files into a single directory node — which
-   * degrades EXT4/NTFS performance at scale.
-   *
-   *   key  → SHA-256 hex  e3b0c442...
-   *   path → {dir}/e3/e3b0c442...
+   * SHA-256 hex digest of a key (pure CPU, no I/O).
+   * Kept separate from path construction so callers can find files by prefix
+   * without knowing which filename generation was used when the file was written.
    */
-  private keyToPath(key: string): string {
-    const hash = crypto.createHash('sha256').update(key, 'utf8').digest('hex');
-    return path.join(this.opts.dir, hash.slice(0, 2), hash);
+  private keyToHash(key: string): string {
+    return crypto.createHash('sha256').update(key, 'utf8').digest('hex');
+  }
+
+  /**
+   * Build the write path for a NEW file (V3 generation).
+   * Encoding expiresAt in the filename lets purgeNextBucket() skip live entries
+   * with zero file I/O — after readdirSync() it only needs a string parse.
+   *
+   *   {dir}/{hash[0..1]}/{hash}_{expiresAt-hex-12}
+   *   e.g.  {dir}/e3/e3b0c442…abcd_018f7c3b5a00
+   *
+   * 12 hex digits ≈ 6 bytes ≈ year 10889 max.  Padded so length is always 77 chars.
+   */
+  private hashToWritePath(hash: string, expiresAt: number): string {
+    return path.join(this.opts.dir, hash.slice(0, 2), `${hash}_${expiresAt.toString(16).padStart(12, '0')}`);
+  }
+
+  /**
+   * Find the on-disk file for a key hash, handling all filename generations:
+   *   V3 (current): "{hash}_{expiresHex12}" — 77 chars
+   *   V1/V2 (older): "{hash}"              — 64 chars, no suffix
+   * Returns null when the bucket dir does not exist or the key is absent.
+   */
+  private findFilePath(hash: string): string | null {
+    const bucketPath = path.join(this.opts.dir, hash.slice(0, 2));
+    let files: string[];
+    try { files = fs.readdirSync(bucketPath); } catch { return null; }
+    // Return the lexicographically largest match: V3 filenames are
+    // "{hash}_{expiresHex12}", so lex-max = largest timestamp = newest entry.
+    // If the same key was evicted to disk twice (different TTLs → different names),
+    // this ensures we always serve and delete the freshest copy; the janitor cleans
+    // up the stale one when its encoded timestamp expires.
+    let match: string | undefined;
+    for (const f of files) {
+      if ((f === hash || f.startsWith(hash + '_')) && (!match || f > match)) match = f;
+    }
+    if (!match) return null;
+    return path.join(bucketPath, match);
   }
 
   /**
@@ -147,6 +190,37 @@ export class DiskTier {
     return Buffer.concat([d.update(ct), d.final()]);
   }
 
+  /**
+   * V2 encryption — returns IV+TAG+ciphertext (no magic prefix; magic lives in
+   * the outer 16-byte header alongside the plaintext expiresAt).
+   * Returns the buffer unchanged when no encryption key is configured.
+   */
+  private encryptV2(data: Buffer): Buffer {
+    const key = this.opts.encryptionKey;
+    if (!key) return data;
+    const iv  = crypto.randomBytes(IV_BYTES);
+    const c   = crypto.createCipheriv(AES_ALGO, key, iv);
+    const enc = Buffer.concat([c.update(data), c.final()]);
+    const tag = c.getAuthTag();
+    return Buffer.concat([iv, tag, enc]);
+  }
+
+  /**
+   * V2 decryption — inner payload after stripping the 16-byte header.
+   * When a key is configured the format is IV(12)+TAG(16)+ciphertext;
+   * without a key the payload is raw msgpack.
+   */
+  private decryptV2(inner: Buffer): Buffer {
+    const key = this.opts.encryptionKey;
+    if (!key) return inner;
+    const iv  = inner.subarray(0, IV_BYTES);
+    const tag = inner.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
+    const ct  = inner.subarray(IV_BYTES + TAG_BYTES);
+    const d   = crypto.createDecipheriv(AES_ALGO, key, iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(ct), d.final()]);
+  }
+
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
@@ -188,14 +262,21 @@ export class DiskTier {
       };
       const packed = pack(payload);
       if (packed.length > this.opts.entryMaxBytes) return;
-      final = this.encrypt(packed);
+      // V2 format: 16-byte plaintext header (magic + expiresAt) followed by the
+      // encrypted-or-raw payload.  The plaintext expiresAt allows purgeNextBucket()
+      // to check expiry with a 16-byte partial read — no decrypt or unpack needed.
+      const header = Buffer.allocUnsafe(V2_HEADER_LEN);
+      DISK_MAGIC_V2.copy(header, 0);
+      header.writeBigUInt64LE(BigInt(entry.expiresAt), 8);
+      final = Buffer.concat([header, this.encryptV2(packed)]);
     } catch (err) {
       this.opts.logger.debug('DiskTier: pack/encrypt failed', { key: key.slice(0, 50), error: (err as Error).message });
       return;
     }
 
-    // ── Async phase: mkdir + write (does not block the event loop) ────────
-    const filePath = this.keyToPath(key);
+    // ── Async phase: mkdir + write (does not block the event loop) ────
+    const hash     = this.keyToHash(key);
+    const filePath = this.hashToWritePath(hash, entry.expiresAt);
     this.diskUsageBytes += final.length; // optimistic — rolled back on error
     this.fileCount++;
 
@@ -216,9 +297,26 @@ export class DiskTier {
     this.ensureDir();
     if (!this.dirReady) return null;
 
-    const filePath = this.keyToPath(key);
+    const hash     = this.keyToHash(key);
+    const filePath = this.findFilePath(hash);
+    if (!filePath) return null;
+
     try {
-      if (!fs.existsSync(filePath)) return null;
+      // V3 fast path: expiresAt is in the filename — avoid even opening the file
+      // when the entry is already known to be stale.
+      const filename = path.basename(filePath);
+      if (filename.length === 77 && filename[64] === '_') {
+        const expiresAt = parseInt(filename.slice(65), 16);
+        if (expiresAt <= Date.now()) {
+          try {
+            const sz = fs.statSync(filePath).size;
+            fs.unlinkSync(filePath);
+            this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+            this.fileCount = Math.max(0, this.fileCount - 1);
+          } catch { /* ok */ }
+          return null;
+        }
+      }
 
       const stat = fs.statSync(filePath);
       if (stat.size > this.opts.entryMaxBytes) {
@@ -232,7 +330,15 @@ export class DiskTier {
       try { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); } catch { /* ok */ }
 
       let decrypted: Buffer;
-      try { decrypted = this.decrypt(raw); } catch { return null; }
+      if (raw.length >= V2_HEADER_LEN && raw.subarray(0, 8).equals(DISK_MAGIC_V2)) {
+        // V2/V3: quick expiry guard from plaintext header before paying decrypt cost
+        const expiresAt = Number(raw.readBigUInt64LE(8));
+        if (expiresAt <= Date.now()) return null;
+        try { decrypted = this.decryptV2(raw.subarray(V2_HEADER_LEN)); } catch { return null; }
+      } else {
+        // V1 / legacy unencrypted — backward compat
+        try { decrypted = this.decrypt(raw); } catch { return null; }
+      }
 
       const payload = unpack(decrypted) as DiskPayload;
       if (!payload || payload.version !== DISK_TIER_VERSION || payload.key !== key) return null;
@@ -251,14 +357,14 @@ export class DiskTier {
 
   /** Explicitly delete a key from disk (cache invalidation). */
   delete(key: string): void {
-    const filePath = this.keyToPath(key);
+    const hash     = this.keyToHash(key);
+    const filePath = this.findFilePath(hash);
+    if (!filePath) return;
     try {
-      if (fs.existsSync(filePath)) {
-        const stat = fs.statSync(filePath);
-        fs.unlinkSync(filePath);
-        this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
-        this.fileCount = Math.max(0, this.fileCount - 1);
-      }
+      const stat = fs.statSync(filePath);
+      fs.unlinkSync(filePath);
+      this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+      this.fileCount = Math.max(0, this.fileCount - 1);
     } catch { /* ok */ }
   }
 
@@ -266,9 +372,50 @@ export class DiskTier {
   purgeExpired(): number {
     this.ensureDir();
     if (!this.dirReady) return 0;
+    const now = Date.now();
     let purged = 0;
+    // One reusable header buffer — avoids per-file allocation inside the V2 fallback loop.
+    const headerBuf = Buffer.allocUnsafe(V2_HEADER_LEN);
     for (const filePath of this.walkCacheFiles()) {
+      const filename = path.basename(filePath);
+
+      // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
+      if (filename.length === 77 && filename[64] === '_') {
+        const expiresAt = parseInt(filename.slice(65), 16);
+        if (expiresAt <= now) {
+          try {
+            const sz = fs.statSync(filePath).size;
+            fs.unlinkSync(filePath);
+            this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+            this.fileCount = Math.max(0, this.fileCount - 1);
+            purged++;
+          } catch { /* already gone */ }
+        }
+        continue;
+      }
+
+      // ── V2 header fast path: read only the 16-byte plaintext header ────────
+      let fd = -1;
       try {
+        fd = fs.openSync(filePath, 'r');
+        const bytesRead = fs.readSync(fd, headerBuf, 0, V2_HEADER_LEN, 0);
+        fs.closeSync(fd); fd = -1;
+
+        if (bytesRead === V2_HEADER_LEN && headerBuf.subarray(0, 8).equals(DISK_MAGIC_V2)) {
+          const expiresAt = Number(headerBuf.readBigUInt64LE(8));
+          if (expiresAt <= now) {
+            try {
+              const sz = fs.statSync(filePath).size;
+              fs.unlinkSync(filePath);
+              this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+              this.fileCount = Math.max(0, this.fileCount - 1);
+              purged++;
+            } catch { /* already gone */ }
+          }
+          continue;
+        }
+
+        // ── Legacy path: V1 encrypted or pre-magic unencrypted ────────────
         const stat = fs.statSync(filePath);
         if (stat.size > this.opts.entryMaxBytes) {
           fs.unlinkSync(filePath);
@@ -281,13 +428,104 @@ export class DiskTier {
         let dec: Buffer;
         try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
         const payload = unpack(dec) as DiskPayload;
-        if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= Date.now()) {
+        if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
           fs.unlinkSync(filePath);
           this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
           this.fileCount = Math.max(0, this.fileCount - 1);
           purged++;
         }
-      } catch { /* skip locked/gone */ }
+      } catch { /* skip locked/gone */ } finally {
+        if (fd >= 0) try { fs.closeSync(fd); } catch { /* ok */ }
+      }
+    }
+    return purged;
+  }
+
+  /**
+   * Purge expired entries from exactly one of the 256 subdirectory buckets, then
+   * advance the wheel pointer.  Call on a short recurring interval (e.g. 30 s) so
+   * the O(fileCount) work of a full purgeExpired() is spread over 256 ticks instead
+   * of landing as one large synchronous burst every 5 minutes.
+   *
+   * V3 files: expiresAt is encoded in the filename — live entries skip with zero
+   * file I/O (just readdirSync + string parse).  Expired entries: statSync + unlinkSync.
+   *
+   * Returns the number of entries deleted in this tick.
+   */
+  purgeNextBucket(): number {
+    this.ensureDir();
+    if (!this.dirReady) return 0;
+    const bucket = this._nextJanitorBucket.toString(16).padStart(2, '0');
+    this._nextJanitorBucket = (this._nextJanitorBucket + 1) % 256;
+    const bucketPath = path.join(this.opts.dir, bucket);
+    let files: string[];
+    try { files = fs.readdirSync(bucketPath); } catch { return 0; }
+    const now = Date.now();
+    let purged = 0;
+    // One reusable header buffer — avoids per-file allocation inside the V2 fallback loop.
+    const headerBuf = Buffer.allocUnsafe(V2_HEADER_LEN);
+    for (const file of files) {
+      // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
+      // Filename format: {sha256-64-hex}_{expiresAt-12-hex} = 77 chars total.
+      if (file.length === 77 && file[64] === '_') {
+        const expiresAt = parseInt(file.slice(65), 16);
+        if (expiresAt <= now) {
+          const filePath = path.join(bucketPath, file);
+          try {
+            const sz = fs.statSync(filePath).size;
+            fs.unlinkSync(filePath);
+            this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+            this.fileCount = Math.max(0, this.fileCount - 1);
+            purged++;
+          } catch { /* already gone */ }
+        }
+        continue; // live or just deleted — no further work
+      }
+
+      // ── V2 header path: open+read(16)+close ───────────────────────────────
+      const filePath = path.join(bucketPath, file);
+      let fd = -1;
+      try {
+        fd = fs.openSync(filePath, 'r');
+        const bytesRead = fs.readSync(fd, headerBuf, 0, V2_HEADER_LEN, 0);
+        fs.closeSync(fd); fd = -1;
+
+        if (bytesRead === V2_HEADER_LEN && headerBuf.subarray(0, 8).equals(DISK_MAGIC_V2)) {
+          const expiresAt = Number(headerBuf.readBigUInt64LE(8));
+          if (expiresAt <= now) {
+            try {
+              const sz = fs.statSync(filePath).size;
+              fs.unlinkSync(filePath);
+              this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+              this.fileCount = Math.max(0, this.fileCount - 1);
+              purged++;
+            } catch { /* already gone */ }
+          }
+          continue;
+        }
+
+        // ── Legacy path: V1 encrypted or pre-magic unencrypted ────────────
+        const stat = fs.statSync(filePath);
+        if (stat.size > this.opts.entryMaxBytes) {
+          fs.unlinkSync(filePath);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
+          purged++;
+          continue;
+        }
+        const raw = fs.readFileSync(filePath);
+        let dec: Buffer;
+        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
+        const payload = unpack(dec) as DiskPayload;
+        if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
+          fs.unlinkSync(filePath);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
+          purged++;
+        }
+      } catch { /* skip locked/gone */ } finally {
+        if (fd >= 0) try { fs.closeSync(fd); } catch { /* ok */ }
+      }
     }
     return purged;
   }

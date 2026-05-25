@@ -112,6 +112,18 @@ class L2CircuitBreaker {
 //  Priority inference — override by passing priority explicitly to get()
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Recursively freezes an object and all its nested properties.
+ * Used only when `CacheOptions.frozen` is true (dev/test mode).
+ * Already-frozen objects are skipped to avoid redundant traversal.
+ */
+function deepFreeze<T>(obj: T): T {
+  if (obj === null || typeof obj !== 'object' || Object.isFrozen(obj)) return obj;
+  Object.freeze(obj);
+  for (const v of Object.values(obj as object)) deepFreeze(v);
+  return obj;
+}
+
 function inferPriority(cacheKey: string): CachePriority {
   if (cacheKey.includes('auth:') || cacheKey.includes('session:'))                                   return CachePriority.CRITICAL;
   if (cacheKey.includes('user:') || cacheKey.includes('org:') || cacheKey.includes('profile:'))      return CachePriority.HIGH;
@@ -151,6 +163,9 @@ export class CacheService {
     tracer: ICacheTracer | undefined;
     notFoundTtl: number;
     warmKeys: string | undefined;
+    onHit: ((key: string, tier: 'l1' | 'disk' | 'l2') => void) | undefined;
+    onMiss: ((key: string) => void) | undefined;
+    frozen: boolean;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -172,6 +187,7 @@ export class CacheService {
   private snapshotLoaded       = false;
   private _readyPromise:       Promise<void> = Promise.resolve();
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
+  private diskJanitorInterval: ReturnType<typeof setInterval> | null = null;
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
   private metricsInterval:     ReturnType<typeof setInterval> | null = null;
   private _shutdownHandler:    (() => void) | null = null;
@@ -258,6 +274,9 @@ export class CacheService {
       tracer:                   options.tracer,
       notFoundTtl:              options.notFoundTtl ?? 0,
       warmKeys:                 options.warmKeys,
+      onHit:                    options.onHit,
+      onMiss:                   options.onMiss,
+      frozen:                   options.frozen ?? false,
     };
 
     // Circuit breaker for L2 Redis
@@ -283,7 +302,13 @@ export class CacheService {
       maxBytes:   this.opts.l1MaxBytes,
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
-      diskSpill:  (key: string, entry: SmartCacheEntry) => { void this.disk.save(key, entry as unknown as DiskCacheEntry); },
+      diskSpill: (key: string, entry: SmartCacheEntry) => {
+        // Defer disk.save() entirely to the next event-loop tick so the synchronous
+        // preamble inside save() (SHA-256 keyToPath + msgpackr pack) does not block
+        // the l1.set() → smartEvict → diskSpill call chain.  Mirrors what the
+        // backplane handler already does for remote invalidations.
+        setImmediate(() => { void this.disk.save(key, entry as unknown as DiskCacheEntry); });
+      },
       onEviction: options.onEviction,
       logger,
     });
@@ -299,15 +324,23 @@ export class CacheService {
     process.once('SIGTERM', this._shutdownHandler);
     process.once('SIGINT',  this._shutdownHandler);
 
-    // Periodic cleanup (5 min)
+    // Periodic L1 cleanup (5 min): expires stale entries and rebalances frequency counters.
+    // Disk cleanup is handled entirely by the janitor below — purgeExpired() is NOT called
+    // here to avoid a synchronous O(fileCount) event-loop stall at scale.
     this.cleanupInterval = setInterval(() => {
       const cleaned = this.l1.cleanup();
-      const diskPurged = this.disk.purgeExpired();
-      if (cleaned > 0 || diskPurged > 0) {
-        this.logger.debug('Periodic cache cleanup', { cleaned, diskPurged });
-      }
+      if (cleaned > 0) this.logger.debug('Periodic L1 cleanup', { cleaned });
     }, 5 * 60 * 1000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref(); // don't block process exit
+
+    // Disk janitor: sole owner of disk expiry. Scans one of 256 subdirectory buckets per tick
+    // (30 s × 256 = 128-min full cycle). Each tick is bounded to one bucket's worth of
+    // readFileSync + decrypt + unpack work, capping per-tick event-loop occupancy.
+    this.diskJanitorInterval = setInterval(() => {
+      const purged = this.disk.purgeNextBucket();
+      if (purged > 0) this.logger.debug('Disk janitor tick', { purged });
+    }, 30_000);
+    if (this.diskJanitorInterval.unref) this.diskJanitorInterval.unref();
 
     // OOM protection: evict coldest L1 entries when heap pressure rises
     if (this.opts.oomProtection) {
@@ -413,10 +446,18 @@ export class CacheService {
     return Math.round(ttlMs * (1 + (Math.random() * 2 - 1) * j));
   }
 
+  /** Shared no-op span for the common case where no tracer is configured.
+   *  Using a singleton avoids allocating a fresh object literal on every get/set/delete call. */
+  private static readonly _nullSpan: ICacheSpan = {
+    setAttribute() { return this; },
+    setStatus()    { return this; },
+    end()          {},
+  };
+
   /** Start an OTEL-compatible span if a tracer is configured. Returns a no-op span otherwise. */
   private _startSpan(name: string): ICacheSpan {
     if (this.opts.tracer) return this.opts.tracer.startSpan(name);
-    return { setAttribute() { return this; }, setStatus() { return this; }, end() {} };
+    return CacheService._nullSpan;
   }
 
   private initBackplane(): void {
@@ -645,10 +686,17 @@ export class CacheService {
       refreshAhead?: number; // 0–1: trigger background recompute at this fraction of TTL elapsed
       xfetchBeta?:  number;  // > 0: XFetch probabilistic early expiration (uses stored delta)
       notFoundTtl?: number;  // seconds; cache null/undefined results with this TTL instead
+      /**
+       * Tags to associate with this cache entry when fetchFn populates it on a miss.
+       * Tags are registered in the in-process `tagIndex` and (if Redis is enabled) mirrored
+       * via `SADD` so that `invalidateTag()` covers disk-spill and multi-instance nodes.
+       * On an L1/L2 hit the tags are already registered — this field is a no-op for hits.
+       */
+      tags?:        string[];
     } = {},
   ): Promise<T> {
     const span = this._startSpan('tricache.get');
-    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
+    if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const k = this.nk(cacheKey); // namespaced key used for all storage
     this.counters.gets++;
 
@@ -670,22 +718,26 @@ export class CacheService {
         this.logger.debug('L1 hit');
         // Refresh-ahead and XFetch: proactively recompute a fresh entry before it expires.
         // l1Hit already carries expiresAt/ttlMs/delta — no second Map lookup needed.
-        if (!this.revalidating.has(k) && (opts.refreshAhead || opts.xfetchBeta)) {
-          const now       = Date.now();
+        // Check opts first — pointless work when neither feature is configured.
+        if (opts.refreshAhead || opts.xfetchBeta) {
+          // Reuse the timestamp already captured by l1.get() — avoids a second Date.now() syscall.
+          const now       = l1Hit.fetchedAt ?? Date.now();
           const remaining = l1Hit.expiresAt - now;
           const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
 
-          const shouldRefreshAhead = opts.refreshAhead != null && opts.refreshAhead > 0
+          const shouldRefreshAhead = !!opts.refreshAhead
             ? remaining <= entryTtl * (1 - opts.refreshAhead)
             : false;
 
           // XFetch: fire with probability proportional to recompute cost (delta) vs. remaining TTL
           // Formula: fire when remaining <= delta * beta * -ln(U), U ~ uniform(0,1)
-          const shouldXFetch = opts.xfetchBeta != null && opts.xfetchBeta > 0 && l1Hit.delta != null
+          const shouldXFetch = !!opts.xfetchBeta && l1Hit.delta != null
             ? remaining <= l1Hit.delta * opts.xfetchBeta * -Math.log(Math.random())
             : false;
 
-          if (shouldRefreshAhead || shouldXFetch) {
+          // Set.has() deferred to here — the common case (fresh key, threshold not crossed)
+          // never pays the ~30 ns lookup cost.
+          if ((shouldRefreshAhead || shouldXFetch) && !this.revalidating.has(k)) {
             // Defer inferPriority until we actually need it — avoids 3× string.includes()
             // scans on every warm hit when the threshold check is false (the common case).
             const priority = opts.priority ?? inferPriority(cacheKey);
@@ -700,6 +752,8 @@ export class CacheService {
         }
       }
       this.counters.l1Hits++;
+      this.opts.onHit?.(cacheKey, 'l1');
+      if (this.opts.frozen) deepFreeze(l1Hit.value);
       span.setAttribute('cache.hit', 'l1').end();
       return l1Hit.value as T;
     }
@@ -719,6 +773,7 @@ export class CacheService {
           const parsed    = JSON.parse(decrypted) as T;
           this.l1.set(k, parsed, ttlMs, priority);
           this.counters.l2Hits++;
+          this.opts.onHit?.(cacheKey, 'l2');
           this.logger.debug('L2 hit (Redis)', { cacheKey });
           span.setAttribute('cache.hit', 'l2').end();
           return parsed;
@@ -740,6 +795,7 @@ export class CacheService {
         const l1Check = this.l1.get(k);
         if (l1Check !== null) {
           this.counters.diskHits++;
+          this.opts.onHit?.(cacheKey, 'disk');
           this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
           span.setAttribute('cache.hit', 'disk').end();
           return l1Check.value as T;
@@ -748,6 +804,7 @@ export class CacheService {
     }
 
     span.setAttribute('cache.hit', 'miss');
+    this.opts.onMiss?.(cacheKey);
 
     // Cache MISS: thundering-herd prevention
     const existing = this.inflight.get(k);
@@ -773,6 +830,7 @@ export class CacheService {
         const storeTtl = swrGraceMs > 0 ? effectiveTtl + swrGraceMs : effectiveTtl;
 
         this.l1.set(k, data, storeTtl, priority, staleAt, delta);
+        if (opts.tags?.length) await this._registerTags(k, opts.tags, Math.ceil(effectiveTtl / 1_000));
 
         if (!this._redisDisabled) {
           try {
@@ -844,35 +902,14 @@ export class CacheService {
   /** Explicitly write a value into L1 (+ L2 in production). */
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[]; dependsOn?: string[] }): Promise<void> {
     const span  = this._startSpan('tricache.set');
-    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
+    if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
     this.l1.set(k, data, ttlMs, p);
 
-    // Register tags in the in-process index (+ Redis SADD)
-    if (opts?.tags?.length) {
-      for (const tag of opts.tags) {
-        const tagKey = this.nk(`_tag_:${tag}`);
-        let members = this.tagIndex.get(tagKey);
-        if (!members) { members = new Set(); this.tagIndex.set(tagKey, members); }
-        members.add(k);
-      }
-      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
-        try {
-          const client = await this.getRedis();
-          const pl = client.pipeline();
-          for (const tag of opts.tags) {
-            const tagKey = this.nk(`_tag_:${tag}`);
-            pl.sadd(tagKey, k);
-            pl.expire(tagKey, ttlSeconds + 3_600);
-          }
-          await pl.exec();
-          this.cb.onSuccess();
-        } catch { this.cb.onFailure(); /* tags are best-effort */ }
-      }
-    }
+    if (opts?.tags?.length) await this._registerTags(k, opts.tags, ttlSeconds);
 
     // Register dependency patterns: when any key matching a pattern is deleted,
     // this key (k) is automatically cascaded.
@@ -903,6 +940,32 @@ export class CacheService {
   }
 
   /**
+   * Register tags for a cache key in the in-process index and (if Redis is enabled) in
+   * the Redis SADD index. Tags are best-effort — a Redis failure does not throw.
+   */
+  private async _registerTags(k: string, tags: string[], ttlSeconds: number): Promise<void> {
+    for (const tag of tags) {
+      const tagKey = this.nk(`_tag_:${tag}`);
+      let members = this.tagIndex.get(tagKey);
+      if (!members) { members = new Set(); this.tagIndex.set(tagKey, members); }
+      members.add(k);
+    }
+    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+      try {
+        const client = await this.getRedis();
+        const pl = client.pipeline();
+        for (const tag of tags) {
+          const tagKey = this.nk(`_tag_:${tag}`);
+          pl.sadd(tagKey, k);
+          pl.expire(tagKey, ttlSeconds + 3_600);
+        }
+        await pl.exec();
+        this.cb.onSuccess();
+      } catch { this.cb.onFailure(); /* tags are best-effort */ }
+    }
+  }
+
+  /**
    * Delete one key or a glob pattern (supports `*` wildcard).
    *
    * @example
@@ -911,7 +974,7 @@ export class CacheService {
    */
   async delete(cacheKey: string): Promise<void> {
     const span      = this._startSpan('tricache.delete');
-    span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
+    if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const isPattern = cacheKey.includes('*');
     const k         = this.nk(cacheKey);
     this.counters.deletes++;
@@ -920,7 +983,13 @@ export class CacheService {
       this.l1.deletePattern(k);
     } else {
       this.l1.delete(k);
-      this.disk.delete(k);
+      // Defer the synchronous SHA-256 hash + fs syscalls to the next event-loop tick so
+      // the caller's await resolves without blocking.  Matches what the backplane handler
+      // already does for remote invalidations: setImmediate(() => this.disk.delete(msg.key)).
+      // A re-get in the narrow window before the deferred call fires would get an L1 miss
+      // and promote the disk entry back — acceptable for a cache (same trade-off the backplane
+      // path already accepts).
+      setImmediate(() => this.disk.delete(k));
       // Cascade: invalidate any key that declared it depends on this exact key's pattern
       this._cascadeDependencies(k);
       // Clean up: remove k from all dependency registrations (it is gone)
@@ -1101,6 +1170,34 @@ export class CacheService {
   }
 
   /**
+   * High-throughput bulk scan over all live L1 entries.
+   *
+   * Compared with `entries()` this avoids generator frame overhead, per-entry
+   * `[key, value]` tuple allocation, and the `key.slice()` allocation when the
+   * caller uses the `offset` parameter instead of pre-slicing.
+   *
+   * ```typescript
+   * // Zero extra string allocations — use rawKey + offset directly:
+   * cache.scan((rawKey, value, offset) => {
+   *   const key = rawKey.slice(offset); // allocate only if needed
+   *   sync(key, value as User);
+   * });
+   * ```
+   *
+   * @param fn Called once per live L1 entry.
+   *           `rawKey`  — key with namespace prefix still attached.
+   *           `value`   — deserialized cached value.
+   *           `offset`  — `rawKey.slice(offset)` gives the bare key without namespace.
+   */
+  scan<T = unknown>(fn: (rawKey: string, value: T, offset: number) => void): void {
+    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    this.l1.scan((key, entry, pfx) => {
+      const value = (entry.value !== undefined ? entry.value : entry.data) as T;
+      fn(key, value, pfx);
+    }, prefixLen);
+  }
+
+  /**
    * Extend the TTL of a key in L1 (and fire-and-forget EXPIRE in Redis) without fetching.
    * Returns `false` if the key is absent or already expired.
    *
@@ -1240,7 +1337,7 @@ export class CacheService {
    * const loaded = await cache.warmFromL2('org:*');
    * console.log(`Warmed ${loaded} keys from Redis`);
    */
-  async warmFromL2(pattern: string): Promise<number> {
+  async warmFromL2(pattern: string, opts?: { priority?: CachePriority }): Promise<number> {
     if (this._redisDisabled) return 0;
     try {
       const client  = await this.getRedis();
@@ -1277,8 +1374,8 @@ export class CacheService {
           // Use a 10-minute TTL as a reasonable default; the real TTL is not
           // returned by GET (use PTTL to be precise, but that doubles round-trips).
           const remainingMs = 10 * 60 * 1_000;
-          this.l1.set(matchedKeys[i], parsed, remainingMs, inferPriority(matchedKeys[i]));
-          loaded++;
+          this.l1.set(matchedKeys[i], parsed, remainingMs, opts?.priority ?? inferPriority(matchedKeys[i]));
+          loaded++;;
         } catch { /* skip malformed entries */ }
       }
       void now; // suppress unused warning
@@ -1325,6 +1422,61 @@ export class CacheService {
         }
       } catch (err) {
         this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+      }
+    }
+  }
+
+  /**
+   * Invalidate all keys associated with any of the given tags in a single operation.
+   * Combines multiple `invalidateTag()` calls into one Redis pipeline round-trip,
+   * reducing latency when invalidating several related tags together.
+   *
+   * Note: Redis pipelines are batched, not atomic. All L1/disk deletes happen
+   * synchronously before the Redis round-trip.
+   *
+   * @example
+   * // Instead of three serial round-trips:
+   * await cache.invalidateTags(['case:acme', 'org:acme', 'ai-chat:acme']);
+   */
+  async invalidateTags(tags: string[]): Promise<void> {
+    if (tags.length === 0) return;
+    if (tags.length === 1) { await this.invalidateTag(tags[0]); return; }
+
+    // In-process: collect all member keys across all tags and remove from L1 + disk
+    const tagKeys: string[] = [];
+    const allMembers = new Set<string>();
+    for (const tag of tags) {
+      const tagKey = this.nk(`_tag_:${tag}`);
+      tagKeys.push(tagKey);
+      const members = this.tagIndex.get(tagKey) ?? new Set<string>();
+      for (const k of members) allMembers.add(k);
+      this.tagIndex.delete(tagKey);
+    }
+    for (const k of allMembers) {
+      this.l1.delete(k);
+      this.disk.delete(k);
+    }
+
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        // Single round-trip: pipeline SMEMBERS for all tag keys
+        const pl = client.pipeline();
+        for (const tagKey of tagKeys) pl.smembers(tagKey);
+        const smResults = await pl.exec() as Array<[Error | null, string[] | null]>;
+
+        // Merge Redis members into the master delete set
+        const toDelete: string[] = [...allMembers];
+        for (const [err, redisMembers] of smResults) {
+          if (!err && redisMembers) {
+            for (const k of redisMembers) { if (!allMembers.has(k)) toDelete.push(k); }
+          }
+        }
+        // Single DEL for all member keys + tag keys
+        const keysToRemove = [...toDelete, ...tagKeys];
+        if (keysToRemove.length > 0) await client.del(...keysToRemove);
+      } catch (err) {
+        this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
       }
     }
   }
@@ -1633,9 +1785,10 @@ export class CacheService {
 
   /** Close Redis connections and stop all background timers. */
   async destroy(): Promise<void> {
-    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
-    if (this.oomInterval)     clearInterval(this.oomInterval);
-    if (this.metricsInterval) clearInterval(this.metricsInterval);
+    if (this.cleanupInterval)     clearInterval(this.cleanupInterval);
+    if (this.diskJanitorInterval)  clearInterval(this.diskJanitorInterval);
+    if (this.oomInterval)          clearInterval(this.oomInterval);
+    if (this.metricsInterval)      clearInterval(this.metricsInterval);
     if (this._shutdownHandler) {
       process.off('SIGTERM', this._shutdownHandler);
       process.off('SIGINT',  this._shutdownHandler);

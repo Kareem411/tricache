@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-05-25
+
+### Added
+
+- **`onHit` / `onMiss` callbacks** — Two new `CacheOptions` hooks for per-tier hit/miss observability without waiting for the `onMetrics` interval. `onHit(key, tier)` fires on every L1, disk, or L2 hit; `onMiss(key)` fires when all three tiers are exhausted.
+
+  ```typescript
+  CacheService.create({
+    onHit:  (key, tier) => cloudwatch.putMetricData({ key, tier }),
+    onMiss: (key)       => cloudwatch.putMetricData({ key }),
+  });
+  ```
+
+- **`frozen` mode (development guard)** — New `CacheOptions.frozen` option. When `true`, every value returned from an L1 hit is recursively frozen with `Object.freeze()` before being handed to the caller. Mutation attempts throw `TypeError` immediately, catching reference-semantic corruption bugs that would otherwise silently corrupt cached entries. Intended for non-production environments only.
+
+  ```typescript
+  CacheService.create({ frozen: process.env.NODE_ENV !== 'production' });
+  ```
+
+- **`tags` in `cache.get()` opts** — `tags` can now be supplied directly in the `opts` argument of `cache.get()`. When `fetchFn` fires on a miss and populates the entry, the listed tags are automatically registered in both the in-process `tagIndex` and (if Redis is enabled) the Redis SADD index. This removes the need to call `cache.set()` separately just to attach tags.
+
+  ```typescript
+  const user = await cache.get(
+    `user:${id}`,
+    () => db.users.find(id),
+    300,
+    { tags: ['users', `tenant:${tenantId}`] },
+  );
+  ```
+
+- **`DiskTier.purgeNextBucket()`** — New public method that purges expired entries from exactly one of 256 subdirectory buckets per call. `CacheService` now drives disk cleanup with a 30-second `setInterval` (one bucket/tick → full sweep in ~128 minutes) instead of the former blocking `purgeExpired()` call every 5 minutes. Per-tick event-loop occupancy is bounded regardless of disk entry count. V3 filenames (expiry encoded in name) skip all file I/O for live entries.
+
+### Fixed
+
+- **AES-128-CTR encryption correctness** — `cipher.final()` / `decipher.final()` return values are now captured and appended in all four encrypt/decrypt paths (`encryptString`, `decryptString`, `encryptBuffer`, `decryptBuffer`). For CTR mode the final block is almost always empty, but discarding it was technically incorrect and could corrupt multi-byte plaintexts whose length is not a cipher-block multiple. Both the string and buffer paths in `encryption.ts` are corrected.
+
+- **File descriptor leak in `DiskTier.purgeExpired()`** — The V2 header-read loop opened an `fd` via `fs.openSync()` inside a try/catch but only called `fs.closeSync()` on the success path. An exception between open and close (e.g. permission error on `statSync`) left the descriptor open. A `finally` block now closes `fd` whenever it is ≥ 0.
+
+- **Disk spill no longer blocks the L1 eviction call chain** — `disk.save()` (called from the L1 `diskSpill` callback during eviction) and `disk.delete()` (called from `cache.delete()` on pattern deletes) are now both deferred via `setImmediate()`. The synchronous SHA-256 hash, msgpackr pack, and filesystem syscalls inside those calls no longer occupy the event loop on the critical `l1.set()` → `smartEvict` → `diskSpill` path.
+
+### Performance
+
+- **Size-aware Bloom filter** — `createBloomFilter()` now accepts `maxEntries` and selects between the WASM filter (hardcoded at 100 K bits, rated for ≈ 10 400 entries at 1 % FP) and a right-sized pure-JS filter. For caches configured with more entries than the WASM filter's capacity, the JS filter is instantiated with optimal bit count ($m = \lceil -n \cdot \ln p \,/\, (\ln 2)^2 \rceil$) and hash count ($k = \text{round}(\ln 2 \cdot m / n)$, clamped to `[4, 10]`). Prevents FP rate saturation that was silently forcing wasted `Map.get()` calls on every definite miss in large caches.
+
+- **Pure-string glob matcher replaces `RegExp` on `deletePattern` hot path** — Three-level fast path: (1) trailing-only wildcard matching a configured category prefix → O(1) via existing `categoryKeys` index; (2) exactly one `'*'` → inline `startsWith` + `endsWith` + length check, zero allocation; (3) general multi-`'*'` → split once, then `globMatchParts()` (prefix anchor + suffix anchor + left-to-right `indexOf` for middle segments, no backtracking). `RegExp` construction and `.test()` are gone from all three paths.
+
+- **Proactive eviction watermark** — `SmartMemoryCache` now runs a single eviction pass whenever either the entry count **or** byte usage crosses 90 % of its configured ceiling, even while headroom remains. This amortises eviction cost across many writes instead of deferring it until the hard ceiling triggers a large forced eviction.
+
+- **Bloom filter dirty-count threshold proportional to `maxEntries`** — The per-delete dirty counter cap is now `max(256, min(capacity >>> 2, ceil(maxEntries × 0.05)))`. Without the cap, a right-sized JS filter for 50 K entries allowed ~12 500 ghost entries before a rebuild (5× longer than the 10 K WASM filter), raising the measured false-positive rate. The new formula restores the original cadence: rebuild after ~5 % of configured entries are deleted.
+
+- **Bloom `add()` skipped on overwrites** — Re-adding an existing key to the Bloom filter inflated the `insertions` counter, delaying phantom-bit detection (trigger 2). The `add()` call is now guarded by `if (!existingEntry)`.
+
+- **WASM module compiled once** — The `WasmBloomFilter` constructor previously called `new WebAssembly.Module(bytes)` on every instantiation. The compiled module is now a module-level constant (`BLOOM_WASM_MODULE`), compiled once at import time. Multiple `SmartMemoryCache` instances (e.g. per-namespace) share the compiled module.
+
+- **Null OTEL span singleton** — `CacheService._nullSpan` replaces the per-call `{ setAttribute() {…}, end() {…} }` object literal returned when no tracer is configured. Eliminates one heap allocation per `get`/`set`/`delete` call in the common no-tracer path.
+
+- **`span.setAttribute()` guarded by tracer presence** — `setAttribute('cache.key_prefix', …)` is now only called when a tracer is actually configured, avoiding a string-split and a method dispatch on the null span for every operation.
+
+- **`_registerTags()` extracted** — Tag registration logic (in-process `tagIndex` update + Redis `SADD`/`EXPIRE` pipeline) is deduplicated into a single private `_registerTags()` method shared by `set()` and the `get()`-miss populate path.
+
+- **`revalidating.has(k)` deferred past threshold check** — The `Set.has()` lookup (~30 ns) for the inflight revalidation guard is now only executed when `shouldRefreshAhead || shouldXFetch` is already true, saving the lookup on every warm hit when neither threshold is crossed.
+
+- **`SmartMemoryCache.scan()` — non-generator bulk traversal** — New public method that accepts a callback `(key, entry, prefixLen) => void` and iterates all live entries in a single `for…of` loop. Avoids generator state-machine overhead and per-entry tuple allocation compared to the existing `liveEntries()` generator. Intended for `CacheService` bulk operations (e.g. `hotKeys`, snapshot serialisation) where the generator protocol adds measurable overhead.
+
+---
+
 ## [0.5.0] — 2026-05-23
 
 ### Performance

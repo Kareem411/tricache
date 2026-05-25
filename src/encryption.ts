@@ -220,11 +220,12 @@ export class CacheEncryption {
     if (this._mode === 'aes-128-ctr') {
       const iv  = this._nextCtrIV();
       const c   = createCipheriv('aes-128-ctr', this._key, iv);
-      const enc = c.update(plaintext, 'utf8'); // CTR: stream cipher — final() emits no bytes
-      c.final();
-      const out = Buffer.allocUnsafe(CTR_IV_BYTES + enc.length);
+      const enc = c.update(plaintext, 'utf8');
+      const fin = c.final(); // CTR: almost always empty — captured defensively
+      const out = Buffer.allocUnsafe(CTR_IV_BYTES + enc.length + fin.length);
       iv.copy(out, 0);
       enc.copy(out, CTR_IV_BYTES);
+      if (fin.length > 0) fin.copy(out, CTR_IV_BYTES + enc.length);
       return PREFIX_CTR + out.toString('base64');
     }
     const algo   = this._mode === 'aes-128-gcm' ? 'aes-128-gcm' : 'aes-256-gcm';
@@ -276,9 +277,9 @@ export class CacheEncryption {
       const iv = combined.subarray(0, CTR_IV_BYTES);
       const ct = combined.subarray(CTR_IV_BYTES);
       const d  = createDecipheriv('aes-128-ctr', key, iv);
-      const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
-      d.final();
-      return plain.toString('utf8');
+      const plain = d.update(ct);
+      const fin   = d.final(); // CTR: almost always empty — concat before UTF-8 decode to avoid split-sequence corruption
+      return (fin.length > 0 ? Buffer.concat([plain, fin]) : plain).toString('utf8');
     }
     const is256 = value.startsWith(PREFIX_256);
     const is128 = value.startsWith(PREFIX_128);
@@ -314,13 +315,14 @@ export class CacheEncryption {
     if (this._mode === 'aes-128-ctr') {
       const iv  = this._nextCtrIV();
       const c   = createCipheriv('aes-128-ctr', this._key, iv);
-      const enc = c.update(data); // CTR: stream cipher — final() emits no bytes
-      c.final();
+      const enc = c.update(data);
+      const fin = c.final(); // CTR: almost always empty — captured defensively
       // Single pre-allocated output buffer: magic(8) | iv(16) | ciphertext(N)
-      const out = Buffer.allocUnsafe(MAGIC_LEN + CTR_IV_BYTES + enc.length);
+      const out = Buffer.allocUnsafe(MAGIC_LEN + CTR_IV_BYTES + enc.length + fin.length);
       MAGIC_CTR.copy(out, 0);
       iv.copy(out, MAGIC_LEN);
       enc.copy(out, MAGIC_LEN + CTR_IV_BYTES);
+      if (fin.length > 0) fin.copy(out, MAGIC_LEN + CTR_IV_BYTES + enc.length);
       return out;
     }
     const magic = this._mode === 'aes-128-gcm' ? MAGIC_128 : MAGIC_256;
@@ -375,9 +377,9 @@ export class CacheEncryption {
       const iv = data.subarray(MAGIC_LEN, MAGIC_LEN + CTR_IV_BYTES);
       const ct = data.subarray(MAGIC_LEN + CTR_IV_BYTES);
       const d  = createDecipheriv('aes-128-ctr', key, iv);
-      const plain = d.update(ct); // CTR: stream cipher — final() emits no bytes
-      d.final();
-      return plain;
+      const plain = d.update(ct);
+      const fin   = d.final(); // CTR: almost always empty — captured defensively
+      return fin.length > 0 ? Buffer.concat([plain, fin]) : plain;
     }
     const is256 = magic.equals(MAGIC_256);
     const is128 = magic.equals(MAGIC_128);

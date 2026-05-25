@@ -17,7 +17,7 @@ import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, 
 
 // Reusable return object for get() — eliminates one heap allocation per hot read.
 // Safe because JS is single-threaded: callers consume all fields before the next get().
-const _hit: CacheHit = { value: undefined, isStale: false, expiresAt: 0, ttlMs: undefined, delta: undefined };
+const _hit: CacheHit = { value: undefined, isStale: false, expiresAt: 0, ttlMs: undefined, delta: undefined, fetchedAt: 0 };
 import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
 
@@ -93,15 +93,35 @@ class JsBloomFilter {
 
 type AnyBloomFilter = JsBloomFilter | WasmBloomFilter;
 
-function createBloomFilter(logger: ILogger): AnyBloomFilter {
+/**
+ * Return a bloom filter sized for `maxEntries` at a ~1 % false-positive target.
+ *
+ * The WASM filter is hardcoded at 100 K bits (k = 7), which holds ≈ 10 400 entries
+ * at 1 % FP.  For larger caches the filter saturates quickly, producing high FP rates
+ * that force wasted Map.get() calls on every definite miss.  When `maxEntries` exceeds
+ * the WASM filter's rated capacity, we instantiate a JS filter sized via the optimal
+ * formula:  m = ⌈–n · ln p / (ln 2)²⌉  with  k = round(ln 2 · m / n)  clamped to [4, 10].
+ */
+function createBloomFilter(logger: ILogger, maxEntries: number): AnyBloomFilter {
+  // Compute optimal bit-count for p = 1 % and the requested entry ceiling.
+  const LN2_SQ       = Math.LN2 * Math.LN2;               // (ln 2)²  ≈ 0.4804
+  const optimalBits  = Math.ceil(-maxEntries * Math.log(0.01) / LN2_SQ);
+  const optimalK     = Math.max(4, Math.min(10, Math.round(Math.LN2 * optimalBits / maxEntries)));
+
   try {
     const wasm = new WasmBloomFilter();
-    logger.debug('SmartMemoryCache: WASM BloomFilter active');
-    return wasm;
+    if (wasm.maxCapacity >= maxEntries) {
+      logger.debug('SmartMemoryCache: WASM BloomFilter active');
+      return wasm;
+    }
+    // WASM filter is undersized for this cache — fall through to right-sized JS filter.
+    logger.debug('SmartMemoryCache: WASM BloomFilter capacity too small, using sized JS BloomFilter', {
+      wasmCapacity: wasm.maxCapacity, maxEntries, optimalBits,
+    });
   } catch (err) {
     logger.debug('SmartMemoryCache: WASM unavailable — using pure-JS BloomFilter', { reason: (err as Error).message });
-    return new JsBloomFilter();
   }
+  return new JsBloomFilter(optimalBits, optimalK);
 }
 
 // ─── Count-Min Sketch ─────────────────────────────────────────────────────────
@@ -179,6 +199,46 @@ class CountMinSketch {
   }
 }
 
+// ─── Glob matcher ───────────────────────────────────────────────────────────────
+
+/**
+ * Pure-string glob matcher — replaces RegExp on the deletePattern hot path.
+ * Supports only '*' wildcards (any sequence, including empty).
+ * No NFA/DFA state machine, no backtracking.
+ *
+ * Two-layer design to avoid per-key allocation in the inner loop:
+ *   globMatch()      — public entry point; splits the pattern once.
+ *   globMatchParts() — hot inner loop; receives the pre-split segments.
+ *
+ * Algorithm:
+ *   1. First segment anchors the prefix  (startsWith, O(|first|)).
+ *   2. Last  segment anchors the suffix  (endsWith,   O(|last|)).
+ *   3. Middle segments are located left-to-right with indexOf (O(N) total, no re-scan).
+ */
+function globMatchParts(parts: string[], first: string, last: string, key: string): boolean {
+  if (first.length > 0 && !key.startsWith(first)) return false;
+  if (last.length  > 0 && !key.endsWith(last))    return false;
+  if (first.length + last.length > key.length)     return false; // anchors overlap
+
+  // Walk any middle segments left-to-right — indexOf never backtracks.
+  let pos = first.length;
+  const end = key.length - last.length;
+  for (let i = 1; i < parts.length - 1; i++) {
+    const seg = parts[i];
+    if (seg.length === 0) continue; // consecutive '*' — skip
+    const idx = key.indexOf(seg, pos);
+    if (idx === -1 || idx + seg.length > end) return false;
+    pos = idx + seg.length;
+  }
+  return true;
+}
+
+function globMatch(pattern: string, key: string): boolean {
+  const parts = pattern.split('*');
+  if (parts.length === 1) return pattern === key; // no wildcard — exact match
+  return globMatchParts(parts, parts[0], parts[parts.length - 1], key);
+}
+
 // ─── SmartMemoryCache ─────────────────────────────────────────────────────────
 
 export interface SmartMemoryCacheOptions {
@@ -213,7 +273,7 @@ export class SmartMemoryCache {
 
   constructor(opts: SmartMemoryCacheOptions, existing?: Map<string, SmartCacheEntry>) {
     this.opts             = opts;
-    this.bloom            = createBloomFilter(opts.logger);
+    this.bloom            = createBloomFilter(opts.logger, opts.maxEntries);
     this.categoryPrefixes = Object.keys(opts.categories).filter(k => k !== 'default');
 
     if (existing) {
@@ -274,7 +334,21 @@ export class SmartMemoryCache {
     const catSz  = this.categorySize.get(category)  ?? 0;
     const catOvf = catCnt >= lim.maxEntries || catSz + neededSize > lim.maxSizeBytes;
     const glbOvf = this.cache.size >= this.opts.maxEntries || this.totalSize + neededSize > this.opts.maxBytes;
-    if (!catOvf && !glbOvf) return;
+    if (!catOvf && !glbOvf) {
+      // Proactive watermark: when either the global entry count OR total byte
+      // usage crosses 90 % of its configured ceiling while there is still
+      // headroom, run one eviction pass now — during the cheap headroom path —
+      // so the hard cliffs at 100 % are rarely reached and writes at full
+      // capacity become uncommon. Both dimensions are guarded so that
+      // large-payload workloads (where maxBytes is the binding constraint)
+      // benefit equally alongside entry-count-bound workloads.
+      const entryWatermark = this.cache.size      >= Math.floor(this.opts.maxEntries * 0.9);
+      const byteWatermark  = this.totalSize + neededSize >= Math.floor(this.opts.maxBytes  * 0.9);
+      if (entryWatermark || byteWatermark) {
+        this.smartEvict(category, false);
+      }
+      return;
+    }
     this.smartEvict(category, catOvf);
   }
 
@@ -305,9 +379,15 @@ export class SmartMemoryCache {
     // Two independent triggers — whichever fires first:
     //   1. Phantom count (insertions of dead keys since last rebuild)
     //   2. Deletion count (ANY _delete() call — expiry, eviction, or explicit)
-    // Trigger 2 uses maxCapacity>>>2 (~4500) so eviction/expiry cycling doesn't
-    // accumulate stale bits for thousands of ops before trigger 1 fires.
-    if (this._bloomDirtyCount > (this.bloom.maxCapacity >>> 2) ||
+    //
+    // Dirty-count cap: bloom.maxCapacity grows proportionally with filter size, but
+    // we want rebuild frequency to stay proportional to cache ENTRY count, not bit
+    // count.  Without the cap a JS filter sized for 50 K entries allows ~12 500 ghost
+    // entries before a rebuild — 5× longer than the old WASM filter, which let phantom
+    // bits accumulate and raised the measured FP rate.  The cap restores the original
+    // rebuild cadence: rebuild after ~5 % of maxEntries are deleted, with a 256 floor.
+    const dirtyThreshold = Math.max(256, Math.min(this.bloom.maxCapacity >>> 2, Math.ceil(this.opts.maxEntries * 0.05)));
+    if (this._bloomDirtyCount > dirtyThreshold ||
         this.bloom.insertions - this.cache.size > this.bloom.maxCapacity) {
       this.bloom.rebuild(this.cache.keys());
       this._bloomDirtyCount = 0;
@@ -400,6 +480,7 @@ export class SmartMemoryCache {
     _hit.expiresAt = entry.expiresAt;
     _hit.ttlMs    = entry.ttlMs;
     _hit.delta    = entry.delta;
+    _hit.fetchedAt = now;
     return _hit;
   }
 
@@ -438,7 +519,9 @@ export class SmartMemoryCache {
 
     const now = Date.now();
     this.cache.set(key, { data: packed, value: data, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta });
-    this.bloom.add(key);
+    // Only add new keys to the bloom — overwrites already have their bits set.
+    // Re-adding inflates the insertions counter, delaying trigger-2 phantom detection.
+    if (!existingEntry) this.bloom.add(key);
     this.maybeRebuildBloom();
     this.totalSize += size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 0) + 1);
@@ -456,9 +539,40 @@ export class SmartMemoryCache {
 
   private keysMatchingPattern(pattern: string): string[] {
     if (!pattern.includes('*')) return this.cache.has(pattern) ? [pattern] : [];
-    const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+
+    // Fast path: trailing-only wildcard whose prefix exactly matches a configured
+    // category (e.g. deletePattern('user:*') when 'user:' is a category).
+    // categoryKeys already indexes all live keys per category prefix in O(1),
+    // so we skip the O(N) Map scan and regex evaluation entirely.
+    // We snapshot via Array.from() before returning so _delete() mutations to
+    // the Set during the subsequent iteration are safe.
+    if (pattern.endsWith('*') && pattern.indexOf('*') === pattern.length - 1) {
+      const prefix = pattern.slice(0, -1);
+      const catKeys = this.categoryKeys.get(prefix);
+      if (catKeys !== undefined) return Array.from(catKeys);
+    }
+
+    // Fast path: exactly one '*' that is NOT at the end (e.g. "user:*:profile").
+    // AOT detection lets us avoid globMatchParts dispatch and its empty middle-
+    // segment loop — keys only need startsWith + endsWith + length checks inline.
+    const firstStar = pattern.indexOf('*');
+    if (firstStar === pattern.lastIndexOf('*')) {
+      const prefix  = pattern.slice(0, firstStar);
+      const suffix  = pattern.slice(firstStar + 1);   // empty when star is last char
+      const minLen  = prefix.length + suffix.length;
+      const out: string[] = [];
+      for (const k of this.cache.keys()) {
+        if (k.length >= minLen && k.startsWith(prefix) && k.endsWith(suffix)) out.push(k);
+      }
+      return out;
+    }
+
+    // General case: multiple '*' wildcards — split once, then scan.
+    const parts = pattern.split('*');
+    const first = parts[0];
+    const last  = parts[parts.length - 1];
     const out: string[] = [];
-    for (const k of this.cache.keys()) if (re.test(k)) out.push(k);
+    for (const k of this.cache.keys()) if (globMatchParts(parts, first, last, k)) out.push(k);
     return out;
   }
 
@@ -631,6 +745,31 @@ export class SmartMemoryCache {
     const now = Date.now();
     for (const [key, entry] of this.cache) {
       if (entry.expiresAt > now) yield [key, entry];
+    }
+  }
+
+  /**
+   * Non-generator bulk scan over all live entries.
+   *
+   * Faster than the generator-based iterators for bulk operations because:
+   *  - No generator state-machine overhead (no yield/resume suspend points).
+   *  - No per-entry tuple allocation (compare `liveEntries()` which yields `[key, entry]`).
+   *  - The same Map call-site is used by a single plain `for` loop instead of being
+   *    shared across three competing generator functions, giving V8's IC a cleaner
+   *    monomorphic profile for this path.
+   *
+   * The callback receives the raw (namespaced) key and a `prefixLen` offset so the
+   * caller can call `key.slice(prefixLen)` only when it actually needs the stripped
+   * key, avoiding the allocation entirely for callers that don't.
+   *
+   * @param fn        Called once per live entry.
+   * @param prefixLen Number of bytes to skip to reach the un-namespaced portion of the key.
+   *                  Pass 0 when no namespace is configured.
+   */
+  scan(fn: (key: string, entry: SmartCacheEntry, prefixLen: number) => void, prefixLen: number): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt > now) fn(key, entry, prefixLen);
     }
   }
 

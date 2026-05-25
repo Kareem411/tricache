@@ -119,6 +119,9 @@ export interface CacheHit {
   ttlMs?: number;
   /** Fetch duration in ms stored at write time — for XFetch probabilistic threshold */
   delta?: number;
+  /** Timestamp (Date.now()) recorded inside SmartMemoryCache.get() — lets CacheService
+   *  reuse this value for refresh-ahead/XFetch math instead of making a second syscall. */
+  fetchedAt?: number;
 }
 
 // ─── Disk tier ───────────────────────────────────────────────────────────────
@@ -478,4 +481,38 @@ export interface CacheOptions {
    * No-op when Redis is disabled or unreachable — safe to set unconditionally.
    */
   warmKeys?: string;
+
+  /**
+   * Called on every L1, disk, or L2 cache hit. Receives the caller-facing key (no
+   * namespace prefix) and the tier that served it. Useful for per-route hit-rate
+   * metrics without waiting for the `onMetrics` interval.
+   *
+   * @example
+   * onHit: (key, tier) => cloudwatch.putMetricData({ key, tier })
+   */
+  onHit?: (key: string, tier: 'l1' | 'disk' | 'l2') => void;
+
+  /**
+   * Called on every cache miss (after L1, disk, and L2 are all exhausted).
+   * Receives the caller-facing key (no namespace prefix).
+   *
+   * @example
+   * onMiss: (key) => cloudwatch.putMetricData({ key })
+   */
+  onMiss?: (key: string) => void;
+
+  /**
+   * When `true`, every value returned from an L1 cache hit is recursively
+   * frozen with `Object.freeze()` before being handed to the caller.
+   * Any attempt to mutate the returned object throws a `TypeError` immediately,
+   * catching reference-semantic corruption bugs that would otherwise silently
+   * corrupt the cached entry.
+   *
+   * **Do not enable in production** — use `process.env.NODE_ENV !== 'production'`.
+   * Deep-freezing large objects has measurable overhead per hit.
+   *
+   * @example
+   * frozen: process.env.NODE_ENV !== 'production'
+   */
+  frozen?: boolean;
 }
