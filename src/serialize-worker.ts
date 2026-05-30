@@ -14,9 +14,9 @@
  */
 
 import { parentPort, workerData } from 'worker_threads';
-import { CacheEncryption } from './encryption.js';
-import type { EncryptionMode } from './encryption.js';
-import type { ILogger } from './types.js';
+import { CacheEncryption } from './encryption';
+import type { EncryptionMode } from './encryption';
+import type { ILogger } from './types';
 
 interface WorkerInit {
   keyBase64:     string;
