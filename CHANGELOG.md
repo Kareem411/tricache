@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-05-31
+
+### Fixed
+
+- `serialize-worker.ts` imports switched to explicit `.ts` extensions (`./encryption.ts`, `./types.ts`). tsx resolves `.ts` imports natively without any hook; the previous extensionless imports were rewritten to `.js` by esbuild (package `"type":"module"`) and tsx's `.js`→`.ts` remap hook is not active inside worker threads on Node 22. Also adds `allowImportingTsExtensions: true` + `rewriteRelativeImportExtensions: true` to `tsconfig.json` to allow the explicit `.ts` import syntax while keeping DTS emit correct.
+
 ## [0.6.2] — 2026-05-31
 
 ### Fixed
