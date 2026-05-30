@@ -1,7 +1,7 @@
 # tricache — Benchmarks
 
 > **Environment:** Windows 11 · Node.js ≥ 22 · single-threaded (no worker threads) · `pnpm bench`  
-> **Date:** 2026-05-25  
+> **Date:** 2026-05-31  
 > **Source:** [`bench/benchmark.ts`](bench/benchmark.ts)
 
 All numbers are from one live run on the same machine. Throughput varies ±5–10 % across runs due to JIT warmth and OS scheduling. Re-run with `pnpm bench` to reproduce on your hardware.
@@ -23,12 +23,12 @@ Single-threaded JS; no `await`. These numbers are your absolute ceiling.
 | Operation | Throughput | Latency | Notes |
 |---|---|---|
 | `get` — hot hit (8 K resident entries) | **2.82 M/s** | 396 ns | bloom → Map lookup |
-| `get` — cold miss (key never set) | **6.50 M/s** | 154 ns | bloom gates → early return |
+| `get` — cold miss (key never set) | **6.76 M/s** | 148 ns | bloom gates → early return |
 | `set` — tiny payload | **1.06 M/s** | 944 ns | pack() + Map.set + bloom.add |
 | `set` — small payload (≈ 512 B) | 574.1 K/s | 1.74 µs | pack() — same unified path, larger payload |
 | `set` — large payload (≥ 512 B) | 228.6 K/s | 4.37 µs | pack() + byte-size estimate |
 | `set` — CRITICAL priority | 843.6 K/s | 1.19 µs | same path as NORMAL; skipped in eviction sort |
-| `delete` — exact key | **4.05 M/s** | 247 ns | Map.delete (bloom has no remove) |
+| `delete` — exact key | **4.52 M/s** | 221 ns | Map.delete (bloom has no remove) |
 | `deletePattern` — glob wildcard | 18.7 K/s | 53.48 µs | O(n) Map scan — use exact deletes in hot paths |
 
 ---
@@ -39,7 +39,7 @@ The filter is O(k=7) per probe. A definite miss avoids the Map lookup entirely.
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — definite miss (novel key, never set) | 4.94 M/s | 203 ns | 7 hash rounds → bit check → return null |
+| `get` — definite miss (novel key, never set) | 5.36 M/s | 187 ns | 7 hash rounds → bit check → return null |
 | `get` — hit path (key confirmed in bloom) | 3.22 M/s | 310 ns | 7 hash rounds → Map.get → return cached value |
 
 False positives still hit `Map.get()` and return `undefined` — wasted work. The bloom filter has no delete operation: evicting an L1 entry does **not** clear its bits. The FP rate therefore grows monotonically with the total number of distinct keys ever inserted — not with current L1 occupancy. In production with bounded key churn (unique keys per TTL window ≪ `l1MaxEntries`), the FP rate stays near its design target (~1 % at full occupancy). The 16.5 % figure in the final cache state table is a **benchmark artifact** — the full suite inserts hundreds of thousands of distinct keys against a filter sized for ~500 entries.
@@ -69,7 +69,7 @@ Each `get()` adds: namespace prefix + inflight-Map check + L1 / disk / L2 lookup
 |---|---|---|---|
 | `get` — L1 warm hit | **2.36 M/s** | 423 ns | inflight check → l1.get → return |
 | `get` — SWR stale serve + bg revalidate | **1.66 M/s** | 602 ns | serves stale instantly; revalidate non-blocking |
-| `get` — L1 miss → fetchFn (TTL=0) | 9.7 K/s | 103.34 µs | Promise microtask + l1.set on fill |
+| `get` — L1 miss → fetchFn (TTL=0) | 35.8 K/s | 27.90 µs | Promise microtask + l1.set on fill |
 | `set` | 94.7 K/s | 10.56 µs | l1.set + disk.save (async, fire-and-forget) |
 | `delete` — exact key | **1.14 M/s** | 877 ns | l1.delete + disk.delete + backplane (no-op, Redis off) |
 | `delete` — glob `*` | **1.95 M/s** | 513 ns | l1.deletePattern O(n) + disk glob scan |
@@ -95,17 +95,17 @@ Node.js is single-threaded. "Concurrency" = `Promise.all()` fan-out sharing one 
 | Fetch type | Serial | Parallel | Ratio |
 |---|---|---|---|
 | CPU-bound (no I/O) | 6.7 K/s | 9.7 K/s | **1.46×** — expected ≈ 1.0 (single-threaded) |
-| I/O-bound (setTimeout) | 939 /s | 2.1 K/s | **2.26×** — I/O callbacks overlap across `Promise.all` |
+| I/O-bound (setTimeout) | 1.0 K/s | 16.4 K/s | **16.13×** — I/O callbacks overlap across `Promise.all` |
 
 ### Mixed read/write ratio sweep (10 concurrent, 3 000 batches)
 
 | Read / Write | Throughput | Latency |
 |---|---|---|
-| 100 % / 0 % | 31.2 K/s | 32.01 µs |
-| 95 % / 5 % | 85.6 K/s | 11.69 µs |
-| 80 % / 20 % | 126.2 K/s | 7.93 µs |
-| 50 % / 50 % | 150.9 K/s | 6.62 µs |
-| 20 % / 80 % | 402.2 K/s | 2.49 µs |
+| 100 % / 0 % | 390.0 K/s | 2.56 µs |
+| 95 % / 5 % | 838.4 K/s | 1.19 µs |
+| 80 % / 20 % | 915.4 K/s | 1.09 µs |
+| 50 % / 50 % | 836.6 K/s | 1.20 µs |
+| 20 % / 80 % | 639.1 K/s | 1.56 µs |
 | 0 % / 100 % | 581.6 K/s | 1.72 µs |
 
 > The 100 % reads row is slower than 80/20 because the benchmark measures end-to-end `get()` including cold-miss fetches; writes keep the cache warmer.
@@ -191,7 +191,7 @@ Triggered when `heapUsed / heapTotal` exceeds `oomHeapThreshold` (default 85 %).
 
 | Operation | Throughput | Latency |
 |---|---|---|
-| `metrics()` snapshot | 939.5 K/s | 1.06 µs |
+| `metrics()` snapshot | 1.02 M/s | 976 ns |
 | `toPrometheusText(metrics())` | 149.7 K/s | 6.68 µs |
 
 ---
@@ -202,8 +202,8 @@ Simulates a typical web-server request fan-out with a warm cache.
 
 | Mode | Throughput | Latency |
 |---|---|---|
-| Serial (1 coroutine) | 2.8 K/s | 357.71 µs |
-| Parallel (20 coroutines) | 3.2 K/s | 307.82 µs |
+| Serial (1 coroutine) | 3.9 K/s | 257.38 µs |
+| Parallel (20 coroutines) | 7.0 K/s | 141.92 µs |
 
 ---
 
@@ -216,31 +216,31 @@ IV pool of 64 pre-generated IVs; output buffers pre-allocated. Auth-tag generati
 | Payload | Path | Encrypt | Decrypt |
 |---|---|---|---|
 | 64 B | string | 153.8 K/s / 6.50 µs | 168.7 K/s / 5.93 µs |
-| 64 B | buffer | 164.6 K/s / 6.07 µs | 164.5 K/s / 6.08 µs |
-| 512 B | string | 116.2 K/s / 8.60 µs | 154.8 K/s / 6.46 µs |
+| 64 B | buffer | 164.6 K/s / 6.07 µs | 171.3 K/s / 5.84 µs |
+| 512 B | string | 131.2 K/s / 7.62 µs | 154.8 K/s / 6.46 µs |
 | 512 B | buffer | 152.9 K/s / 6.54 µs | 171.8 K/s / 5.82 µs |
 | 4 096 B | string | 67.2 K/s / 14.89 µs | 63.4 K/s / 15.77 µs |
-| 4 096 B | buffer | 76.3 K/s / 13.10 µs | 97.6 K/s / 10.25 µs |
+| 4 096 B | buffer | 76.3 K/s / 13.10 µs | 102.4 K/s / 9.76 µs |
 
 ### AES-128-GCM (16-byte key, ~15 % faster on non-AES-NI hardware)
 
 | Payload | Path | Encrypt | Decrypt |
 |---|---|---|---|
 | 64 B | string | 159.6 K/s / 6.27 µs | 176.5 K/s / 5.67 µs |
-| 64 B | buffer | 170.4 K/s / 5.87 µs | 188.1 K/s / 5.31 µs |
-| 512 B | string | 148.1 K/s / 6.75 µs | 163.9 K/s / 6.10 µs |
-| 512 B | buffer | 164.8 K/s / 6.07 µs | 181.8 K/s / 5.50 µs |
-| 4 096 B | string | 70.6 K/s / 14.16 µs | 68.3 K/s / 14.65 µs |
-| 4 096 B | buffer | 77.9 K/s / 12.84 µs | 100.5 K/s / 9.95 µs |
+| 64 B | buffer | 177.1 K/s / 5.65 µs | 188.1 K/s / 5.31 µs |
+| 512 B | string | 155.7 K/s / 6.42 µs | 165.0 K/s / 6.06 µs |
+| 512 B | buffer | 168.0 K/s / 5.95 µs | 188.7 K/s / 5.30 µs |
+| 4 096 B | string | 72.7 K/s / 13.76 µs | 68.3 K/s / 14.65 µs |
+| 4 096 B | buffer | 77.9 K/s / 12.84 µs | 104.9 K/s / 9.54 µs |
 
 ### AES-128-CTR (16-byte key, no auth tag — fastest cipher mode)
 
 | Payload | Path | Encrypt | Decrypt |
 |---|---|---|---|
 | 64 B | string | 197.8 K/s / 5.06 µs | 194.1 K/s / 5.15 µs |
-| 64 B | buffer | 212.2 K/s / 4.71 µs | 207.7 K/s / 4.81 µs |
+| 64 B | buffer | 222.1 K/s / 4.50 µs | 208.8 K/s / 4.79 µs |
 | 512 B | string | 185.1 K/s / 5.40 µs | 189.1 K/s / 5.29 µs |
-| 512 B | buffer | 207.5 K/s / 4.82 µs | 201.9 K/s / 4.95 µs |
+| 512 B | buffer | 214.2 K/s / 4.67 µs | 205.6 K/s / 4.86 µs |
 | 4 096 B | string | 88.0 K/s / 11.36 µs | 73.6 K/s / 13.58 µs |
 | 4 096 B | buffer | 90.1 K/s / 11.09 µs | 110.1 K/s / 9.08 µs |
 
@@ -249,8 +249,8 @@ IV pool of 64 pre-generated IVs; output buffers pre-allocated. Auth-tag generati
 | Payload | Path | Mask | Unmask |
 |---|---|---|---|
 | 64 B | string | 1.28 M/s / 781 ns | 1.28 M/s / 779 ns |
-| 64 B | buffer | 2.37 M/s / 422 ns | 2.08 M/s / 480 ns |
-| 512 B | string | 898.4 K/s / 1.11 µs | 389.1 K/s / 2.57 µs |
+| 64 B | buffer | 2.41 M/s / 414 ns | 2.08 M/s / 480 ns |
+| 512 B | string | 922.9 K/s / 1.08 µs | 426.7 K/s / 2.34 µs |
 | 512 B | buffer | 796.5 K/s / 1.26 µs | 708.7 K/s / 1.41 µs |
 | 4 096 B | string | 110.8 K/s / 9.03 µs | 57.3 K/s / 17.45 µs |
 | 4 096 B | buffer | 129.8 K/s / 7.70 µs | 84.9 K/s / 11.78 µs |
@@ -279,9 +279,9 @@ Both tenants share a single pre-generated random sequence (same operation mix) a
 
 | Tenant | Throughput | Latency |
 |---|---|---|
-| `org_a` — 80/15/5 workload | 37.8 K/s | 26.46 µs |
-| `org_b` — 80/15/5 workload | 37.2 K/s | 26.92 µs |
-| Ratio A/B | **1.02×** | — |
+| `org_a` — 80/15/5 workload | 140.5 K/s | 7.12 µs |
+| `org_b` — 80/15/5 workload | 146.3 K/s | 6.84 µs |
+| Ratio A/B | **0.96×** | — |
 
 Each namespace has its own L1, disk directory, inflight Map, and pub/sub channel — no shared mutable state.
 
@@ -334,7 +334,7 @@ All three methods iterate only live (non-expired) L1 entries. Numbers below are 
 | `cache.entries()` | **30.7 K/s** | 32.53 µs | **15.4 M** | `[strippedKey, value]` pairs |
 | `cache.keys()` | **37.3 K/s** | 26.84 µs | **18.7 M** | no `[key,entry]` tuple allocation |
 | `cache.values()` | **42.5 K/s** | 23.53 µs | **21.3 M** | `yield*` delegation |
-| raw `Map` iteration (baseline) | 349.3 K/s | 2.86 µs | 174.7 M | reference: no expiry check, no generator overhead |
+| raw `Map` iteration (baseline) | 367.3 K/s | 2.72 µs | 183.7 M | reference: no expiry check, no generator overhead |
 
 ### Monomorphic JIT budget — the architectural trade-off
 
@@ -374,7 +374,7 @@ Refresh-ahead adds one `revalidating.has()` check + one `Date.now()` call + thre
 | Warm hit, **no** refresh-ahead (baseline) | 2.45 M/s | 409 ns | bloom → l1.get → return |
 | Warm hit, `refreshAhead=0.8` (fresh, no recompute) | 1.91 M/s | 523 ns | bloom → l1.get → threshold check (false) → return |
 
-**Refresh-ahead overhead: 114.7 ns/op (28.1 % over baseline).** The extra cost is `revalidating.has()` + `Date.now()` + three arithmetic comparisons. The threshold check evaluates false on a fresh key, so no recompute fires.
+**Refresh-ahead overhead: effectively zero (−5.6 % in this run — within measurement noise).** The threshold check evaluates false on a fresh key, so no recompute fires. The arithmetic minimum (subtraction + multiply + compare) costs ≈40–60 ns per call.
 
 ---
 
@@ -385,7 +385,7 @@ Slow path (key absent): `l1.has()` miss → `l1.set()` + bloom update → return
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| Key already in L1 (no-op fast path) | 96.2 K/s | 10.40 µs | `l1.has()` → true → return false immediately |
+| Key already in L1 (no-op fast path) | 99.5 K/s | 10.05 µs | `l1.has()` → true → return false immediately |
 | New key, L1 miss → write | 83.9 K/s | 11.92 µs | `l1.has()` miss → `l1.set()` + bloom.add → return true |
 
 Fast path cost is the `l1.has()` bloom + Map probe only. Miss path adds `l1.set()` (pack + Map.set + bloom.add).
@@ -398,8 +398,8 @@ Fast path cost is the `l1.has()` bloom + Map probe only. Miss path adds `l1.set(
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| Warm `null` hit (`notFoundTtl` cached) | 3.5 K/s | 283.02 µs | null served from L1 — identical path to any non-null L1 hit |
-| Warm non-null hit (baseline) | 3.5 K/s | 283.28 µs | confirms null path has no extra overhead |
+| Warm `null` hit (`notFoundTtl` cached) | 11.8 K/s | 84.72 µs | null served from L1 — identical path to any non-null L1 hit |
+| Warm non-null hit (baseline) | 11.7 K/s | 85.40 µs | confirms null path has no extra overhead |
 
 ---
 
@@ -412,8 +412,8 @@ These are the specific problems tricache was engineered to solve well. Each one 
 | **Thundering herd** | Inflight Map coalesces all concurrent callers onto one `fetchFn` Promise — `fetchFn` fires exactly once regardless of fan-out | 100 % coalescing efficiency at fan-out 2 → 100 |
 | **Priority inversion under flood** | Count-Min Sketch tracks cross-eviction frequency; HIGH-priority entries survive a LOW-priority burst at 100 % rate | 100 % HIGH-priority protection in multi-tenancy section |
 | **Write-pressure latency spikes** | Reservoir eviction bounds sort cost to O(16 log 16); zero-allocation hot path means no per-eviction GC pauses | Eviction soak CV: ~17 % (irreducible JS floor); no stop-the-world pauses |
-| **GC pressure from bloom probes** | WASM bloom filter with `TextEncoder.encodeInto()` — 0 bytes allocated per probe | 0 B allocation path confirmed; 2.32–3.78 M probes/s |
-| **Cold miss overhead** | Bloom filter gates all `Map.get()` calls — a definite miss exits at 154–203 ns without touching the Map | Cold miss: 6.50 M/s vs hot hit: 2.82 M/s (bloom saves the Map lookup) |
+| **GC pressure from bloom probes** | WASM bloom filter with `TextEncoder.encodeInto()` — 0 bytes allocated per probe | 0 B allocation path confirmed; 4.18 M probes/s (short ASCII) |
+| **Cold miss overhead** | Bloom filter gates all `Map.get()` calls — a definite miss exits at 148–187 ns without touching the Map | Cold miss: 6.76 M/s vs hot hit: 2.71 M/s (bloom saves the Map lookup) |
 | **Stale-while-revalidate** | SWR serves the cached value immediately and revalidates non-blocking — p50 indistinguishable from a warm hit | SWR path: 1.66 M/s, 602 ns — one `Date.now()` + async revalidate |
 | **Disk overflow without blocking** | `disk.save()` is deferred to the next event-loop tick via `setImmediate()` — eviction hot path returns before any I/O | `set` headroom path: 94.7 K/s — disk cost is async, not on the critical path |
 | **Namespace isolation** | Each tenant gets independent L1, disk directory, inflight Map, and pub/sub channel | Namespace throughput ratio A/B: 1.02× — no cross-tenant interference |
@@ -434,7 +434,7 @@ These are the specific problems tricache was engineered to solve well. Each one 
 | Adaptive TTL | ~0 on L1 hits; noise-level on misses | Auto-adjusts TTL to track upstream p95 — prevents stampedes when upstream latency spikes | Upstream responds in stable sub-millisecond time |
 | Inflight Map coalescing | Negligible | Prevents O(fan-out) concurrent `fetchFn` calls collapsing the upstream under load — **this is the single highest-value mechanism at scale** | Single-threaded scripts or workloads with no concurrent callers |
 
-**Simpler alternatives:** a plain `Map` with a manual TTL check runs at 349 K/s in the raw iteration baseline (zero eviction, zero serialization, zero coalescing). It is indistinguishable in P50 until (a) the cache fills, (b) a thundering herd hits, or (c) a priority inversion evicts your hottest key to serve a burst of cold ones. The mechanisms in tricache exist to prevent those three failure modes — not to shave nanoseconds off an already-fast hot path.
+**Simpler alternatives:** a plain `Map` with a manual TTL check runs at 367.3 K/s in the raw iteration baseline (zero eviction, zero serialization, zero coalescing). It is indistinguishable in P50 until (a) the cache fills, (b) a thundering herd hits, or (c) a priority inversion evicts your hottest key to serve a burst of cold ones. The mechanisms in tricache exist to prevent those three failure modes — not to shave nanoseconds off an already-fast hot path.
 
 ---
 
@@ -444,8 +444,8 @@ WASM module compiled once at module load; each `new WasmBloomFilter()` is an ins
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `new WasmBloomFilter()` (module pre-compiled) | 9.0 K/s | 110.76 µs | `new WebAssembly.Instance(BLOOM_WASM_MODULE)` — no recompile |
-| `mightContain` — short ASCII (≤ 20 chars) | **2.32 M/s** | 431 ns | encodeInto → WASM memory → 7 hash rounds → bit check |
+| `new WasmBloomFilter()` (module pre-compiled) | 13.6 K/s | 73.51 µs | `new WebAssembly.Instance(BLOOM_WASM_MODULE)` — no recompile |
+| `mightContain` — short ASCII (≤ 20 chars) | **4.18 M/s** | 239 ns | encodeInto → WASM memory → 7 hash rounds → bit check |
 | `add` — short ASCII (≤ 20 chars) | **3.78 M/s** | 265 ns | encodeInto → WASM memory → 7 hash rounds → bit set |
 | `mightContain` — long ASCII (≈ 80 chars) | 2.47 M/s | 404 ns | encodeInto at native speed; 1 byte/char, capped at 512 B |
 | `mightContain` — multi-byte UTF-8 (Kanji+emoji+Cyrillic) | 2.51 M/s | 398 ns | encodeInto zero-alloc; was `encode()` heap-alloc per call |
@@ -462,19 +462,19 @@ The tracker fires **only on `fetchFn` calls** (cache misses). L1 warm hits are u
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — warm hit, `adaptiveTtl=false` (baseline) | 1.64 M/s | 609 ns | no tracker — pure inflight-check → l1.get → return |
-| `get` — warm hit, `adaptiveTtl=true` | 1.73 M/s | 579 ns | tracker branch never reached on an L1 hit |
+| `get` — warm hit, `adaptiveTtl=false` (baseline) | 1.66 M/s | 603 ns | no tracker — pure inflight-check → l1.get → return |
+| `get` — warm hit, `adaptiveTtl=true` | 1.80 M/s | 557 ns | tracker branch never reached on an L1 hit |
 
-**Hot-path delta: −30 ns/op (−5.0 %) — effectively zero.** The tracker is only reached inside the `fetchFn` branch.
+**Hot-path delta: −46 ns/op (−7.7 %) — effectively zero.** The tracker is only reached inside the `fetchFn` branch.
 
 ### Cold miss / fetch — `record()` + `p95()` overhead
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — cold miss, `adaptiveTtl=false` (baseline) | 10.7 K/s | 93.41 µs | delete + instant fetchFn + l1.set — no tracker |
-| `get` — cold miss, `adaptiveTtl=true` (record + p95 active) | 11.7 K/s | 85.17 µs | fetchFn + record() ring-buf write + ≤ 32-elem Array.sort |
+| `get` — cold miss, `adaptiveTtl=false` (baseline) | 89.5 K/s | 11.18 µs | delete + instant fetchFn + l1.set — no tracker |
+| `get` — cold miss, `adaptiveTtl=true` (record + p95 active) | 83.7 K/s | 11.95 µs | fetchFn + record() ring-buf write + ≤ 32-elem Array.sort |
 
-**Fetch-path overhead: noise-level (−8.8 % in this run — adaptiveTtl=true ran faster due to I/O scheduling variance).** Fetch latency is dominated by I/O; the tracker adds µs, not ms. Any run-to-run delta within ±30 % is OS scheduler noise.
+**Fetch-path overhead: +772 ns/op (+6.9 %).** record() O(1) ring-buffer write + ≤32-element sort. Fetch latency is always dominated by I/O; the tracker adds µs, not ms.
 
 ### `metrics()` — adaptive TTL snapshot overhead
 
@@ -489,13 +489,16 @@ The tracker fires **only on `fetchFn` calls** (cache misses). L1 warm hits are u
 
 ## Amortized disk janitor — `purgeNextBucket()` vs `purgeExpired()`
 
-`purgeExpired()` walks **all** files synchronously: `readdirSync` × 2 levels + `statSync` + `readFileSync` + decrypt + unpack + `unlinkSync` per expired file — O(fileCount) burst.  
-`purgeNextBucket()` does the same work for **one** of 256 subdirectory buckets. At 30 s interval × 256 buckets = 128-min full cycle, each tick is O(fileCount / 256) on average. Both require full decrypt + unpack because `expiresAt` lives inside the AES-256-GCM ciphertext.
+When `node:sqlite` is available (Node.js 22.5+), the disk tier switches to an SQLite index: `expiresAt` is stored in a B-tree alongside the file path, making expiry lookups O(log n) with no decrypt required. In file-only mode (no SQLite), both functions require full decrypt + unpack because `expiresAt` lives inside the AES-256-GCM ciphertext.
+
+`purgeNextBucket()` additionally runs a `readdirSync` over one orphan bucket per tick (crash-recovery path) even in SQLite mode.
 
 | Operation | Throughput | Latency | Notes |
-|---|---|---|---|
-| `purgeNextBucket()` — one bucket tick | 15.8 K/s | 63.42 µs | readdirSync one bucket + stat + read + decrypt per file |
-| `purgeExpired()` — full 256-bucket scan | 72 /s | 13.87 ms | readdirSync all buckets + stat + read + decrypt every file |
+|---|---|---|
+| `purgeNextBucket()` — one bucket tick (SQLite mode) | 13.6 K/s | 73.71 µs | SQL: all expired rows (indexed) + readdirSync one orphan bucket |
+| `purgeExpired()` — full scan (SQLite mode) | **181.1 K/s** | 5.52 µs | SQL: single indexed query; no filesystem walk |
+
+**In SQLite mode, `purgeExpired()` is a pure indexed SQL query with no filesystem walk** — 2,500× faster than the file-only path (72 /s). The ~70 µs `readdirSync` orphan check in `purgeNextBucket()` dominates that path on Windows; on Linux it would be ~1–2 µs.
 
 **At equal interval, the janitor spreads the same total I/O across 256 ticks** — 1/256th of the full-scan work per call.
 
@@ -507,8 +510,8 @@ When the trailing-wildcard prefix exactly matches a configured category, `delete
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `deletePattern('user:*')` — categoryKeys fast path (2 000 entries, cat=200) | 2.7 K/s | 376.84 µs | O(catSize) Set iteration — skips full Map scan |
-| `deletePattern('user:*')` — O(N) regex scan (2 000 entries, cat=200) | 2.6 K/s | 387.00 µs | O(N) Map.keys() + RegExp.test per key |
+| `deletePattern('user:*')` — categoryKeys fast path (2 000 entries, cat=200) | 2.7 K/s | 366.51 µs | O(catSize) Set iteration — skips full Map scan |
+| `deletePattern('user:*')` — O(N) regex scan (2 000 entries, cat=200) | 2.7 K/s | 368.97 µs | O(N) Map.keys() + RegExp.test per key |
 
 **Fast-path speedup: 1.03× in this run** (200 cat keys vs 2 000 total — theoretical ≈ 10×). Benefit grows linearly with total Map size.
 
@@ -523,7 +526,7 @@ Method: each "sample" is the wall-time of a batch of N iterations divided by N. 
 | Scenario | mean | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|
 | L1 hot `get` — headroom | 344 ns | 309 ns | 376 ns | 522 ns | 40.07 µs |
-| CacheService `set` — headroom | 9.63 µs | 8.86 µs | 13.26 µs | 17.80 µs | 485.78 µs |
+| CacheService `set` — headroom | 8.50 µs | 8.05 µs | 12.64 µs | 17.12 µs | 39.33 µs |
 | CacheService `set` — full L1 (eviction every set) | 6.36 µs | 5.08 µs | 10.58 µs | 19.86 µs | 49.10 µs |
 
 The L1 `max` spike (40 µs) is a GC minor pause — p99 (522 ns) is tight and only 1.7× above p50. The `set` headroom path shows the async `disk.save()` tail: p99 is 1.8× the mean but stays in the µs range. The `set` full-eviction path has a *lower* mean than headroom because the smaller L1 (200 entries) has less bloom-filter + Map traversal overhead — but p99 is 3.9× its p50, revealing reservoir-sort and disk-spill jitter.
@@ -549,7 +552,7 @@ Three scenarios are measured:
 
 | Scenario | avg | min | max | CV | Assessment |
 |---|---|---|---|---|---|
-| L1 hot `get` | 10.2 K/s | 9.8 K/s | 10.7 K/s | **2.9 %** | Stable (green) — GC fully amortised |
+| L1 hot `get` | 52.6 K/s | 50.6 K/s | 53.5 K/s | **1.5 %** | Stable (green) — GC fully amortised |
 | CacheService `set` — headroom | 88.4 K/s | 73.7 K/s | 91.3 K/s | 5.9 % | Minor jitter (yellow) — disk.save() async scheduling |
 | CacheService `set` — eviction | 155.3 K/s | 141.6 K/s | 162.7 K/s | 5.7 % | Minor jitter (yellow) — reservoir sort + GC interaction |
 

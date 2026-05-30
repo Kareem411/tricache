@@ -1948,6 +1948,7 @@ note('Reports event-loop utilisation (ELU) and GC pause events. Event-loop delay
   );
   if (mem.heapUsed / mem.heapTotal > 0.90) {
     note('heap > 90% after soak — risk of OOM on longer runs. Lower l1MaxBytes or set l1EvictionWatermark: 0.8.');
+    note('If §19c crashes with OOM, re-run with: NODE_OPTIONS="--max-old-space-size=8192" pnpm bench');
   }
 
   await soakSvcEvict.destroy();
@@ -2098,6 +2099,12 @@ note('Overhead is only visible under L1 eviction pressure (spill path). Hot hits
 // Note: workers are spawned from src/serialize-worker.ts via tsx (dev) or
 // from dist/serialize-worker.js (production). The throughput shown here is
 // for a single worker — real usage uses workerPoolSize (default: min(4,CPUs)).
+
+// The soak section above deliberately pushes the heap to ~90%+.  Force a
+// full GC cycle before allocating the large worker-pool payloads so we don't
+// OOM mid-benchmark on a heap that's already near its limit.
+(globalThis as { gc?: () => void }).gc?.();
+await new Promise(r => setImmediate(r)); // let GC run to completion
 
 header('§19c. Worker pool — off-thread AES-GCM throughput vs sync (per round-trip)');
 note('IPC round-trip cost amortises at ~64–128 KB (varies by CPU / Node.js version).');

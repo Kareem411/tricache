@@ -105,6 +105,13 @@ export interface SmartCacheEntry {
   ttlMs?: number;
   /** Milliseconds taken to fetch/compute this value — used by XFetch probabilistic early expiration. */
   delta?: number;
+  /**
+   * Unix timestamp (ms) when this entry was written.
+   * Stored explicitly so staleness-fence eviction (`evictSetBefore`) is precise
+   * instead of approximating via `expiresAt - ttlMs`.
+   * Optional for backward compatibility with snapshots written by older versions.
+   */
+  setAt?: number;
 }
 
 /** Returned by SmartMemoryCache.get() — distinguishes "cached null" from a real miss */

@@ -18,6 +18,19 @@ import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, 
 // Reusable return object for get() — eliminates one heap allocation per hot read.
 // Safe because JS is single-threaded: callers consume all fields before the next get().
 const _hit: CacheHit = { value: undefined, isStale: false, expiresAt: 0, ttlMs: undefined, delta: undefined, fetchedAt: 0 };
+
+/**
+ * Packed-byte threshold above which the live JS object is NOT stored alongside the
+ * serialised buffer.  For entries above this size, the double-heap overhead (both the
+ * msgpackr Buffer and the deserialized object resident simultaneously) outweighs the
+ * latency saved by skipping unpack on read.  Below the threshold the live object is
+ * stored so hot reads skip deserialization entirely.
+ *
+ * 16 KiB is a conservative default: msgpackr unpacks a 16 KiB buffer in ~0.03 ms,
+ * while storing the deserialized form of a 16 KiB payload typically costs 32–64 KiB
+ * of additional heap depending on object shape.
+ */
+const LARGE_VALUE_BYTES = 16_384;
 import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
 
@@ -551,7 +564,11 @@ export class SmartMemoryCache {
     this.ensureCapacity(cat, size);
 
     const now = Date.now();
-    this.cache.set(key, { data: packed, value: data, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta });
+    // Only cache the live object for small entries — large entries would store the packed
+    // buffer AND a potentially much-larger deserialized object simultaneously (double-heap).
+    // For large entries, get() falls back to the unpack() path transparently.
+    const liveValue = size <= LARGE_VALUE_BYTES ? data : undefined;
+    this.cache.set(key, { data: packed, value: liveValue, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta, setAt: now });
     // Only add new keys to the bloom — overwrites already have their bits set.
     // Re-adding inflates the insertions counter, delaying trigger-2 phantom detection.
     if (!existingEntry) this.bloom.add(key);
@@ -738,9 +755,9 @@ export class SmartMemoryCache {
    * peers while the backplane was down; evicting them forces a controlled
    * cold-start re-fetch from L2 rather than serving silently stale data.
    *
-   * Write-time is approximated as `entry.expiresAt - entry.ttlMs`.
-   * Entries with no stored `ttlMs` (e.g. legacy snapshot imports) are evicted
-   * conservatively.
+   * Write-time is read from `entry.setAt` (set by `SmartMemoryCache.set()` since v0.7.0).
+   * Older snapshot entries without `setAt` fall back to approximating via `expiresAt - ttlMs`;
+   * entries with neither field are treated as potentially stale and evicted conservatively.
    *
    * @param cutoffMs - Unix timestamp in milliseconds; entries written before
    *                   this time are evicted.
@@ -752,11 +769,8 @@ export class SmartMemoryCache {
       // Never evict live CRITICAL entries — auth tokens, active sessions, etc.
       if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > Date.now()) continue;
 
-      // Approximate write-time from the stored TTL.  When ttlMs is missing
-      // (legacy import), treat the entry as potentially stale.
-      const setAt = (entry.ttlMs != null)
-        ? entry.expiresAt - entry.ttlMs
-        : 0; // unknown → assume stale
+      // Prefer the explicit setAt timestamp; fall back to approximation for older entries.
+      const setAt = entry.setAt ?? (entry.ttlMs != null ? entry.expiresAt - entry.ttlMs : 0);
 
       if (setAt < cutoffMs) {
         this._delete(key, 'manual');
@@ -798,8 +812,8 @@ export class SmartMemoryCache {
         : rawData instanceof Uint8Array
           ? Buffer.from(rawData)                          // msgpackr Uint8Array → Buffer
           : rawData as Buffer;                            // already a Buffer
-      // Decode once on import so subsequent gets return the live object without unpacking.
-      const value = unpack(data);
+      // Cache the live object for small entries only — large entries skip double-heap storage.
+      const value = entry.size <= LARGE_VALUE_BYTES ? unpack(data) : undefined;
       this.cache.set(key, { ...entry, data, value, isCompressed: true });
       this.bloom.add(key);
       loaded++;
@@ -861,15 +875,22 @@ export class SmartMemoryCache {
   /**
    * Yields only the resolved values of live entries.
    * Iterates Map.values() so the key is never loaded into the yielded path.
-   * Returns the cached deserialized object when available (entry.value), otherwise
-   * the raw msgpackr Buffer — identical semantics to get() but without bloom/hit tracking.
+   * Returns the deserialized value — identical semantics to get() but without bloom/hit tracking.
    */
   *liveValues(): Generator<unknown> {
     const now = Date.now();
     for (const entry of this.cache.values()) {
       if (entry.expiresAt > now)
-        yield entry.value !== undefined ? entry.value : entry.data;
+        yield this.resolveValue(entry);
     }
+  }
+
+  /**
+   * Returns the deserialized value for an entry, unpacking from the msgpackr buffer
+   * if the live object was not cached (large-entry optimisation or disk-restored entry).
+   */
+  resolveValue(entry: SmartCacheEntry): unknown {
+    return entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────

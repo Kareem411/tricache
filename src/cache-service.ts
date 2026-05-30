@@ -1555,7 +1555,7 @@ export class CacheService {
     const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
     for (const [key, entry] of this.l1.liveEntries()) {
       const k = prefixLen > 0 ? key.slice(prefixLen) : key;
-      yield [k, (entry.value !== undefined ? entry.value : entry.data) as T];
+      yield [k, this.l1.resolveValue(entry) as T];
     }
   }
 

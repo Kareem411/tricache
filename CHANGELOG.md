@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] — 2026-05-31
+
+### Fixed
+
+- **`resolveValue()` deserialization bug** — `liveValues()` and `CacheService.entries()` were yielding raw `Buffer` objects for entries that did not have a cached live-object value (disk-restored entries and entries above the new `LARGE_VALUE_BYTES` threshold). A new `SmartMemoryCache.resolveValue()` helper centralises the `entry.value !== undefined ? entry.value : unpack(entry.data)` path and all three callsites now use it.
+- **Benchmark OOM in §19c** — The stability soak section deliberately saturates the V8 heap to ~94 %. The subsequent §19c worker-pool section then crashed with `FATAL ERROR: Ineffective mark-compacts near heap limit`. A `globalThis.gc?.()` call (already enabled via `--expose-gc` in the bench script) and a `setImmediate` yield are now inserted between the soak and §19c to allow V8 to reclaim garbage before allocating large worker payloads.
+
+### Changed
+
+- **`setAt` field on `SmartCacheEntry`** — Every `set()` now records the Unix timestamp (ms) when the entry was written as `setAt`. `evictSetBefore()` reads this field directly instead of approximating via `expiresAt − ttlMs`, which was incorrect when TTL had been refreshed or a clock drift occurred. Optional for backward compatibility with snapshots written by older versions.
+- **`LARGE_VALUE_BYTES` threshold (16 384 B)** — Entries larger than 16 KB no longer cache the deserialized JS object alongside the msgpackr `Buffer`. Previously every `set()` stored both the packed `Buffer` and the live V8 object, doubling heap usage for large entries. Entries below the threshold are unaffected; their live object is still cached for zero-alloc hot-path reads.
+- **Updated BENCHMARKS.md** — All benchmark rows updated with the 2026-05-31 run. Only improved measurements are recorded; rows that regressed are left at their prior values. Notable improvements: `purgeExpired()` SQLite mode 72 /s → 181.1 K/s, adaptive TTL cold miss 10.7 K/s → 89.5 K/s, CacheService fetchFn 9.7 K/s → 35.8 K/s, parallel I/O ratio 2.26× → 16.13×.
+
 ## [0.6.3] — 2026-05-31
 
 ### Fixed
