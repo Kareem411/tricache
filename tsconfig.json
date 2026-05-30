@@ -15,6 +15,7 @@
     "skipLibCheck":      true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*"],
