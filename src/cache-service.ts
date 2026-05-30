@@ -16,10 +16,11 @@
  *   - Periodic cleanup of expired entries every 5 minutes
  */
 
-import { Redis as RedisClient } from 'ioredis';
+import { Redis as RedisClient, Cluster as RedisCluster } from 'ioredis';
 import { pack, unpack } from 'msgpackr';
 import crypto from 'crypto';
 import os    from 'os';
+import { WorkerPool } from './worker-pool.js';
 import v8    from 'node:v8';
 import fs    from 'fs';
 import path  from 'path';
@@ -258,11 +259,36 @@ function inferPriority(cacheKey: string): CachePriority {
 // globalThis key — allows reuse across hot reloads (Next.js, ts-node watch, etc.)
 const GLOBAL_KEY = '__tricache_instance__';
 
+// ── Union type for single-node, Cluster, and Sentinel Redis clients ───────────
+type AnyRedisClient = RedisClient | RedisCluster;
+
+// ── Serverless environment detection ─────────────────────────────────────────
+/**
+ * Returns the name of the detected serverless/ephemeral-filesystem runtime,
+ * or `null` when running in a regular persistent-disk environment.
+ *
+ * Detection is entirely env-var based — zero I/O, zero network, sub-microsecond.
+ */
+function detectServerlessRuntime(): string | null {
+  if (process.env['AWS_LAMBDA_FUNCTION_NAME'])    return 'AWS Lambda';
+  if (process.env['K_SERVICE'])                   return 'Google Cloud Run';
+  if (process.env['FUNCTION_TARGET'])             return 'Google Cloud Functions';
+  if (process.env['WEBSITE_INSTANCE_ID'])         return 'Azure Functions';
+  if (process.env['FLY_APP_NAME'])                return 'Fly.io';
+  if (process.env['RAILWAY_ENVIRONMENT'])         return 'Railway';
+  if (process.env['VERCEL'])                      return 'Vercel';
+  return null;
+}
+
 export class CacheService {
   private readonly logger:     ILogger;
   private readonly enc:        CacheEncryption;
   private readonly l1:         SmartMemoryCache;
   private readonly disk:       DiskTier;
+  /** When true, all disk-tier and snapshot operations are skipped. */
+  private _diskDisabled = false;
+  /** Worker pool for off-main-thread AES-GCM (null when workerThreads is false or unavailable). */
+  private _workerPool: WorkerPool | null = null;
   private readonly opts: {
     namespace: string;
     logger: ILogger; l1MaxBytes: number; l1MaxEntries: number;
@@ -291,6 +317,13 @@ export class CacheService {
     adaptiveTtlMinMs: number;
     adaptiveTtlMaxMs: number;
     adaptiveTtlMultiplier: number;
+    workerThreads: boolean;
+    workerThresholdBytes: number;
+    workerPoolSize: number;
+    backplaneMaxStalenessMs: number;
+    disableDisk: boolean;
+    redisClusterNodes: Array<{ host: string; port: number }> | undefined;
+    redisSentinel: { name: string; sentinels: Array<{ host: string; port: number }> } | undefined;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -306,8 +339,8 @@ export class CacheService {
    * When an exact-key delete matches a registered pattern, all dependents are cascaded.
    */
   private readonly dependencyIndex = new Map<string, Set<string>>();
-  private redis:               RedisClient | null = null;
-  private redisConnecting:     Promise<RedisClient> | null = null;
+  private redis:               AnyRedisClient | null = null;
+  private redisConnecting:     Promise<AnyRedisClient> | null = null;
   private readonly cb:         L2CircuitBreaker;
   private snapshotLoaded       = false;
   private _readyPromise:       Promise<void> = Promise.resolve();
@@ -319,7 +352,9 @@ export class CacheService {
   private latencyTracker: LatencyTracker | null = null;
   private readonly instanceId:       string;
   private readonly backplaneChannel: string;
-  private subClient:           RedisClient | null = null;
+  private subClient:           AnyRedisClient | null = null;
+  /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
+  private _subDisconnectedAt:  number | null = null;
   private readonly counters = {
     gets:             0,
     l1Hits:           0,
@@ -408,6 +443,13 @@ export class CacheService {
       adaptiveTtlMinMs:         (options.adaptiveTtlMin ?? 10)     * 1_000,
       adaptiveTtlMaxMs:         (options.adaptiveTtlMax ?? 86_400) * 1_000,
       adaptiveTtlMultiplier:    options.adaptiveTtlMultiplier ?? 20,
+      workerThreads:            options.workerThreads       ?? false,
+      workerThresholdBytes:     options.workerThresholdBytes ?? 131_072, // 128 KB
+      workerPoolSize:           options.workerPoolSize       ?? 0,       // 0 = auto (min(4, cpus))
+      backplaneMaxStalenessMs:  options.backplaneMaxStalenessMs ?? 5_000,
+      disableDisk:              options.disableDisk ?? false,
+      redisClusterNodes:        options.redisClusterNodes,
+      redisSentinel:            options.redisSentinel,
     };
 
     // Circuit breaker for L2 Redis
@@ -422,7 +464,24 @@ export class CacheService {
       this.latencyTracker = new LatencyTracker(samples, maxKeys);
     }
 
-    // L1.5 disk tier
+    // ── Fix 3: Serverless / ephemeral-disk detection ──────────────────────────
+    // Resolve disk-disabled flag: explicit option wins; else auto-detect runtime.
+    let diskDisabled = this.opts.disableDisk;
+    if (options.disableDisk === undefined) {
+      const serverless = detectServerlessRuntime();
+      if (serverless !== null) {
+        diskDisabled = true;
+        logger.warn('tricache: disk tier auto-disabled (ephemeral filesystem detected)', {
+          runtime: serverless,
+          hint:    'Set disableDisk: false to override, or disableDisk: true to silence this warning',
+        });
+      }
+    } else if (diskDisabled) {
+      logger.info('tricache: disk tier explicitly disabled (disableDisk: true)');
+    }
+    this._diskDisabled = diskDisabled;
+
+    // L1.5 disk tier (always constructed for metrics shape; ops are no-ops when disabled)
     this.disk = new DiskTier({
       dir:               this.opts.diskCacheDir,
       maxBytes:          this.opts.diskMaxBytes,
@@ -433,7 +492,10 @@ export class CacheService {
     });
 
     this._namespace     = ns;
-    this._redisDisabled = (this.opts.disableRedis || !this.opts.redisHost);
+    // disableRedis takes unconditional precedence; otherwise, L2 is active when
+    // at least one of host / cluster nodes / sentinel is configured.
+    this._redisDisabled = this.opts.disableRedis
+      || (!this.opts.redisHost && !this.opts.redisClusterNodes?.length && !this.opts.redisSentinel);
 
     // L1 in-memory cache
     this.l1 = new SmartMemoryCache({
@@ -442,6 +504,7 @@ export class CacheService {
       categories: this.opts.categoryLimits,
       evictionWatermark: this.opts.l1EvictionWatermark,
       diskSpill: (key: string, entry: SmartCacheEntry) => {
+        if (this._diskDisabled) return; // Fix 3: skip spill in serverless environments
         // Defer disk.save() entirely to the next event-loop tick so the synchronous
         // preamble inside save() (SHA-256 keyToPath + msgpackr pack) does not block
         // the l1.set() → smartEvict → diskSpill call chain.  Mirrors what the
@@ -455,13 +518,43 @@ export class CacheService {
     // Load snapshot once per process
     if (!this.snapshotLoaded) {
       this.snapshotLoaded = true;
-      this.loadSnapshot();
+      if (!this._diskDisabled) this.loadSnapshot(); // Fix 3: skip in ephemeral environments
     }
 
     // Graceful shutdown: persist L1 to disk
-    this._shutdownHandler = () => { this.writeSnapshot(); process.exit(0); };
+    this._shutdownHandler = () => { if (!this._diskDisabled) this.writeSnapshot(); process.exit(0); };
     process.once('SIGTERM', this._shutdownHandler);
     process.once('SIGINT',  this._shutdownHandler);
+
+    // ── Fix 1: Worker thread pool for off-main-thread AES-GCM ────────────────
+    if (this.opts.workerThreads && this.enc.isEnabled) {
+      try {
+        const encRef = this.enc as unknown as {
+          _key: Buffer | null;
+          _mode: string;
+          _prevKey: Buffer | null;
+          _prevMode: string;
+        };
+        this._workerPool = new WorkerPool({
+          keyBase64:     encRef._key ? encRef._key.toString('base64') : '',
+          mode:          encRef._mode as never,
+          prevKeyBase64: encRef._prevKey ? encRef._prevKey.toString('base64') : undefined,
+          prevMode:      encRef._prevMode as never,
+          size:          this.opts.workerPoolSize || undefined,
+        });
+        if (this._workerPool.isAvailable) {
+          logger.info('tricache: worker-thread encryption pool active', {
+            threshold: `${this.opts.workerThresholdBytes / 1024} KB`,
+          });
+        } else {
+          this._workerPool = null;
+          logger.warn('tricache: worker-thread pool requested but unavailable; using main-thread crypto');
+        }
+      } catch {
+        this._workerPool = null;
+        logger.warn('tricache: worker-thread pool init failed; using main-thread crypto');
+      }
+    }
 
     // Periodic L1 cleanup (5 min): expires stale entries and rebalances frequency counters.
     // Disk cleanup is handled entirely by the janitor below — purgeExpired() is NOT called
@@ -472,14 +565,14 @@ export class CacheService {
     }, 5 * 60 * 1000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref(); // don't block process exit
 
-    // Disk janitor: sole owner of disk expiry. Scans one of 256 subdirectory buckets per tick
-    // (30 s × 256 = 128-min full cycle). Each tick is bounded to one bucket's worth of
-    // readFileSync + decrypt + unpack work, capping per-tick event-loop occupancy.
-    this.diskJanitorInterval = setInterval(() => {
-      const purged = this.disk.purgeNextBucket();
-      if (purged > 0) this.logger.debug('Disk janitor tick', { purged });
-    }, 30_000);
-    if (this.diskJanitorInterval.unref) this.diskJanitorInterval.unref();
+    // Disk janitor (Fix 3: skip when disk is disabled)
+    if (!this._diskDisabled) {
+      this.diskJanitorInterval = setInterval(() => {
+        const purged = this.disk.purgeNextBucket();
+        if (purged > 0) this.logger.debug('Disk janitor tick', { purged });
+      }, 30_000);
+      if (this.diskJanitorInterval.unref) this.diskJanitorInterval.unref();
+    }
 
     // OOM protection: evict coldest L1 entries when heap pressure rises
     if (this.opts.oomProtection) {
@@ -603,20 +696,68 @@ export class CacheService {
     if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     if (this.subClient) return;
 
-    const sub = new RedisClient({
-      host:                 this.opts.redisHost,
-      port:                 this.opts.redisPort,
-      tls:                  this.opts.redisTls ? {} : undefined,
-      connectTimeout:       10_000,
-      lazyConnect:          true,
-      maxRetriesPerRequest: null as unknown as number,
-      enableAutoPipelining: false,
-      family:               4,
-      retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
-    });
+    // ── Fix 4: Cluster/Sentinel subscriber ─────────────────────────────────
+    let sub: AnyRedisClient;
+    if (this.opts.redisClusterNodes?.length) {
+      sub = new RedisCluster(this.opts.redisClusterNodes, {
+        redisOptions: {
+          tls:                  this.opts.redisTls ? {} : undefined,
+          connectTimeout:       10_000,
+          maxRetriesPerRequest: null as unknown as number,
+        },
+      });
+    } else if (this.opts.redisSentinel) {
+      sub = new RedisClient({
+        sentinels:            this.opts.redisSentinel.sentinels,
+        name:                 this.opts.redisSentinel.name,
+        tls:                  this.opts.redisTls ? {} : undefined,
+        connectTimeout:       10_000,
+        lazyConnect:          true,
+        maxRetriesPerRequest: null as unknown as number,
+        enableAutoPipelining: false,
+        retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
+      });
+    } else {
+      sub = new RedisClient({
+        host:                 this.opts.redisHost,
+        port:                 this.opts.redisPort,
+        tls:                  this.opts.redisTls ? {} : undefined,
+        connectTimeout:       10_000,
+        lazyConnect:          true,
+        maxRetriesPerRequest: null as unknown as number,
+        enableAutoPipelining: false,
+        family:               4,
+        retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
+      });
+    }
 
     sub.on('error', (e: Error) =>
       this.logger.debug('Backplane subscriber error', { error: e.message }));
+
+    // ── Fix 2: Staleness fence — track disconnect time ──────────────────────
+    sub.on('close', () => {
+      if (this._subDisconnectedAt === null) {
+        this._subDisconnectedAt = Date.now();
+        this.logger.debug('Backplane: subscriber disconnected', { at: this._subDisconnectedAt });
+      }
+    });
+
+    sub.on('ready', () => {
+      if (this._subDisconnectedAt !== null && this.opts.backplaneMaxStalenessMs > 0) {
+        const gapMs = Date.now() - this._subDisconnectedAt;
+        if (gapMs > this.opts.backplaneMaxStalenessMs) {
+          // We were disconnected long enough that peer invalidations were
+          // almost certainly missed.  Evict every L1 entry written before
+          // the disconnect started so stale data cannot be served.
+          const evicted = this.l1.evictSetBefore(this._subDisconnectedAt);
+          this.logger.warn('Backplane: reconnect after gap — flushed potentially stale L1 entries', {
+            gapMs, evicted,
+            hint: 'Increase backplaneMaxStalenessMs or set to 0 to disable the fence',
+          });
+        }
+        this._subDisconnectedAt = null;
+      }
+    });
 
     sub.on('message', (_channel: string, message: string) => {
       this._handleBackplaneMessage(message);
@@ -647,7 +788,7 @@ export class CacheService {
         // setImmediate so the event-loop tick that processes this pub/sub
         // message returns immediately without blocking hot get() calls.
         this.l1.delete(msg.key);
-        setImmediate(() => this.disk.delete(msg.key));
+        setImmediate(() => { if (!this._diskDisabled) this.disk.delete(msg.key); });
         // Cascade: evict dependents registered on this instance for the
         // deleted key — same logic the local delete() path runs, now also
         // applied to peer-originated invalidations so fleet-wide deletes
@@ -676,28 +817,92 @@ export class CacheService {
     } catch { /* non-critical — never block the caller */ }
   }
 
-  private async getRedis(): Promise<RedisClient> {
+  /**
+   * Scan all keys matching `pattern` across single-node or Cluster clients.
+   * For Cluster, iterates every master node independently (SCAN is node-local).
+   */
+  private async _scanKeys(client: AnyRedisClient, pattern: string): Promise<string[]> {
+    const keys: string[] = [];
+    if (client instanceof RedisCluster) {
+      const masters = client.nodes('master');
+      await Promise.all(masters.map((node: RedisClient) =>
+        new Promise<void>((resolve, reject) => {
+          const stream = node.scanStream({ match: pattern, count: 100 });
+          stream.on('data',  (chunk: string[]) => keys.push(...chunk));
+          stream.on('end',   resolve);
+          stream.on('error', reject);
+        }),
+      ));
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const stream = client.scanStream({ match: pattern, count: 100 });
+        stream.on('data',  (chunk: string[]) => keys.push(...chunk));
+        stream.on('end',   resolve);
+        stream.on('error', reject);
+      });
+    }
+    return keys;
+  }
+
+  private async getRedis(): Promise<AnyRedisClient> {
     if (!this.cb.isAllowed()) throw new Error('tricache: L2 circuit breaker is open');
     if (this.redisConnecting) return this.redisConnecting;
 
     this.redisConnecting = (async () => {
       try {
-        const client = new RedisClient({
-          host:                  this.opts.redisHost,
-          port:                  this.opts.redisPort,
-          tls:                   this.opts.redisTls ? {} : undefined,
-          connectTimeout:        10_000,
-          lazyConnect:           false,
-          maxRetriesPerRequest:  3,
-          enableAutoPipelining:  true,
-          keepAlive:             30_000,
-          family:                4,
-          retryStrategy: (times: number) => Math.min(times * 50, 2_000),
-        });
+        // ── Fix 4: Cluster / Sentinel / single-node connection factory ──────
+        let client: AnyRedisClient;
 
-        client.on('connect',      () => this.logger.info('Redis connected', { host: this.opts.redisHost }));
-        client.on('error',        (e: Error) => this.logger.error('Redis error', { host: this.opts.redisHost }, e));
-        client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
+        if (this.opts.redisClusterNodes?.length) {
+          // Redis Cluster — ioredis handles slot routing and multi-node pooling.
+          client = new RedisCluster(this.opts.redisClusterNodes, {
+            redisOptions: {
+              tls:                  this.opts.redisTls ? {} : undefined,
+              connectTimeout:       10_000,
+              maxRetriesPerRequest: 3,
+              keepAlive:            30_000,
+            },
+            enableAutoPipelining: true,
+            retryDelayOnClusterDown: 200,
+            retryDelayOnFailover:    1_000,
+          });
+          client.on('connect',      () => this.logger.info('Redis Cluster connected'));
+          client.on('error',        (e: Error) => this.logger.error('Redis Cluster error', {}, e));
+          client.on('reconnecting', () => this.logger.debug('Redis Cluster reconnecting'));
+        } else if (this.opts.redisSentinel) {
+          // Redis Sentinel — ioredis monitors master via sentinel topology.
+          client = new RedisClient({
+            sentinels:             this.opts.redisSentinel.sentinels,
+            name:                  this.opts.redisSentinel.name,
+            tls:                   this.opts.redisTls ? {} : undefined,
+            connectTimeout:        10_000,
+            lazyConnect:           false,
+            maxRetriesPerRequest:  3,
+            enableAutoPipelining:  true,
+            keepAlive:             30_000,
+            retryStrategy: (times: number) => Math.min(times * 50, 2_000),
+          });
+          client.on('connect',      () => this.logger.info('Redis Sentinel connected', { name: this.opts.redisSentinel!.name }));
+          client.on('error',        (e: Error) => this.logger.error('Redis Sentinel error', { name: this.opts.redisSentinel!.name }, e));
+          client.on('reconnecting', () => this.logger.debug('Redis Sentinel reconnecting'));
+        } else {
+          // Single-node (original path)
+          client = new RedisClient({
+            host:                  this.opts.redisHost,
+            port:                  this.opts.redisPort,
+            tls:                   this.opts.redisTls ? {} : undefined,
+            connectTimeout:        10_000,
+            lazyConnect:           false,
+            maxRetriesPerRequest:  3,
+            enableAutoPipelining:  true,
+            keepAlive:             30_000,
+            family:                4,
+            retryStrategy: (times: number) => Math.min(times * 50, 2_000),
+          });
+          client.on('connect',      () => this.logger.info('Redis connected', { host: this.opts.redisHost }));
+          client.on('error',        (e: Error) => this.logger.error('Redis error', { host: this.opts.redisHost }, e));
+          client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
+        }
 
         await new Promise<void>((resolve, reject) => {
           client.once('ready', resolve);
@@ -921,8 +1126,14 @@ export class CacheService {
         const raw    = await client.get(k);
         this.cb.onSuccess();
         if (raw) {
-          const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
-          const parsed    = JSON.parse(decrypted) as T;
+          // ── Fix 1: offload decryption to worker thread for large payloads ──
+          let decrypted: string;
+          if (this._workerPool && this.enc.isEnabled && raw.length > this.opts.workerThresholdBytes) {
+            decrypted = await this._workerPool.decrypt(raw);
+          } else {
+            decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
+          }
+          const parsed = JSON.parse(decrypted) as T;
           this.l1.set(k, parsed, ttlMs, priority);
           this.counters.l2Hits++;
           this.opts.onHit?.(cacheKey, 'l2');
@@ -936,21 +1147,23 @@ export class CacheService {
       }
     }
 
-    // L1.5: disk tier (evicted L1 entries)
-    const diskHit = this.disk.load(k);
-    if (diskHit !== null) {
-      const promoted = this.l1.importEntries(
-        [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
-        this.opts.forbiddenSnapshotPrefixes,
-      );
-      if (promoted > 0) {
-        const l1Check = this.l1.get(k);
-        if (l1Check !== null) {
-          this.counters.diskHits++;
-          this.opts.onHit?.(cacheKey, 'disk');
-          this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
-          span.setAttribute('cache.hit', 'disk').end();
-          return l1Check.value as T;
+    // L1.5: disk tier (evicted L1 entries) — skipped when disk is disabled
+    if (!this._diskDisabled) {
+      const diskHit = this.disk.load(k);
+      if (diskHit !== null) {
+        const promoted = this.l1.importEntries(
+          [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+          this.opts.forbiddenSnapshotPrefixes,
+        );
+        if (promoted > 0) {
+          const l1Check = this.l1.get(k);
+          if (l1Check !== null) {
+            this.counters.diskHits++;
+            this.opts.onHit?.(cacheKey, 'disk');
+            this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
+            span.setAttribute('cache.hit', 'disk').end();
+            return l1Check.value as T;
+          }
         }
       }
     }
@@ -1003,7 +1216,13 @@ export class CacheService {
           try {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
-            const toStore    = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
+            // ── Fix 1: offload encryption to worker thread for large payloads ──
+            let toStore: string;
+            if (this._workerPool && this.enc.isEnabled && serialized.length > this.opts.workerThresholdBytes) {
+              toStore = await this._workerPool.encrypt(serialized);
+            } else {
+              toStore = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
+            }
             await client.setex(k, Math.ceil(effectiveTtl / 1_000), toStore);
             this.cb.onSuccess();
             this.logger.debug('Cached L1+L2', { cacheKey, ttlSeconds, encrypted: this.enc.isEnabled });
@@ -1048,7 +1267,13 @@ export class CacheService {
         try {
           const client = await this.getRedis();
           const s      = JSON.stringify(data);
-          const stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+          // ── Fix 1: offload encryption to worker thread for large payloads ──
+          let stored: string;
+          if (this._workerPool && this.enc.isEnabled && s.length > this.opts.workerThresholdBytes) {
+            stored = await this._workerPool.encrypt(s);
+          } else {
+            stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+          }
           await client.setex(cacheKey, Math.ceil(ttlMs / 1_000), stored);
         } catch { /* ok */ }
       }
@@ -1097,7 +1322,13 @@ export class CacheService {
       try {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
-        const stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+        // ── Fix 1: offload encryption to worker thread for large payloads ──
+        let stored: string;
+        if (this._workerPool && this.enc.isEnabled && s.length > this.opts.workerThresholdBytes) {
+          stored = await this._workerPool.encrypt(s);
+        } else {
+          stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+        }
         await client.setex(k, Math.ceil(ttlMs / 1_000), stored);
         this.cb.onSuccess();
       } catch (err) {
@@ -1160,7 +1391,7 @@ export class CacheService {
       // A re-get in the narrow window before the deferred call fires would get an L1 miss
       // and promote the disk entry back — acceptable for a cache (same trade-off the backplane
       // path already accepts).
-      setImmediate(() => this.disk.delete(k));
+      setImmediate(() => { if (!this._diskDisabled) this.disk.delete(k); });
       // Cascade: invalidate any key that declared it depends on this exact key's pattern
       this._cascadeDependencies(k);
       // Clean up: remove k from all dependency registrations (it is gone)
@@ -1171,13 +1402,7 @@ export class CacheService {
       try {
         const client = await this.getRedis();
         if (isPattern) {
-          const stream = client.scanStream({ match: k, count: 100 });
-          const keys: string[] = [];
-          await new Promise<void>((resolve, reject) => {
-            stream.on('data',  (chunk: string[]) => keys.push(...chunk));
-            stream.on('end',   resolve);
-            stream.on('error', reject);
-          });
+          const keys = await this._scanKeys(client, k);
           if (keys.length > 0) await client.del(...keys);
         } else {
           await client.del(k);
@@ -1246,7 +1471,7 @@ export class CacheService {
       // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
     } else {
       this.l1.clear();
-      this.disk.clear();
+      if (!this._diskDisabled) this.disk.clear();
       this._l1Counters.clear();
       this.tagIndex.clear();
     }
@@ -1255,13 +1480,7 @@ export class CacheService {
       try {
         const client  = await this.getRedis();
         const pattern = k ?? (this._namespace ? `${this._namespace}:*` : '*');
-        const stream  = client.scanStream({ match: pattern, count: 100 });
-        const keys: string[] = [];
-        await new Promise<void>((resolve, reject) => {
-          stream.on('data',  (chunk: string[]) => keys.push(...chunk));
-          stream.on('end',   resolve);
-          stream.on('error', reject);
-        });
+        const keys    = await this._scanKeys(client, pattern);
         if (keys.length > 0) await client.del(...keys);
       } catch (err) {
         this.logger.debug('clear: Redis unavailable', { error: (err as Error).message });
@@ -1514,14 +1733,8 @@ export class CacheService {
       const client  = await this.getRedis();
       const nsPattern = this.nk(pattern);
 
-      // Collect all matching keys via SCAN
-      const matchedKeys: string[] = [];
-      const stream = client.scanStream({ match: nsPattern, count: 100 });
-      await new Promise<void>((resolve, reject) => {
-        stream.on('data',  (chunk: string[]) => matchedKeys.push(...chunk));
-        stream.on('end',   resolve);
-        stream.on('error', reject);
-      });
+      // Collect all matching keys via SCAN (handles single-node and Cluster)
+      const matchedKeys = await this._scanKeys(client, nsPattern);
 
       if (matchedKeys.length === 0) {
         this.cb.onSuccess();
@@ -1577,7 +1790,7 @@ export class CacheService {
     // Remove from L1 + disk
     for (const k of members) {
       this.l1.delete(k);
-      this.disk.delete(k);
+      if (!this._diskDisabled) this.disk.delete(k);
     }
     this.tagIndex.delete(tagKey);
 
@@ -1814,7 +2027,7 @@ export class CacheService {
       for (const dep of dependents) {
         if (dep === deletedKey) continue; // no self-cascade
         this.l1.delete(dep);
-        this.disk.delete(dep);
+        if (!this._diskDisabled) this.disk.delete(dep);
         void this.publishInvalidation('del', dep);
         this.logger.debug('Dependency cascade: invalidated dependent key', {
           trigger: deletedKey.slice(0, 60), dependent: dep.slice(0, 60),
@@ -1887,7 +2100,7 @@ export class CacheService {
         sizeBytes: this.l1.memoryUsage,
         maxBytes:  this.opts.l1MaxBytes,
       },
-      disk: this.disk.stats,
+      disk: { ...this.disk.stats, disabled: this._diskDisabled },
       ...(this.latencyTracker && {
         adaptiveTtl: {
           enabled: true as const,
@@ -1977,6 +2190,10 @@ export class CacheService {
       process.off('SIGINT',  this._shutdownHandler);
       this._shutdownHandler = null;
     }
+    if (this._workerPool) {
+      await this._workerPool.destroy();
+      this._workerPool = null;
+    }
     if (this.subClient) {
       try { await this.subClient.quit(); } catch { /* ok */ }
       this.subClient = null;
@@ -1985,7 +2202,7 @@ export class CacheService {
       try { await this.redis.disconnect(); } catch { /* ok */ }
       this.redis = null;
     }
-    this.disk.close();
+    if (!this._diskDisabled) this.disk.close();
   }
 
 }

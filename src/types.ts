@@ -221,7 +221,7 @@ export interface CacheMetrics {
   };
 
   l1:   { entries: number; sizeBytes: number; maxBytes: number };
-  disk: { files: number; sizeKB: number; maxKB: number };
+  disk: { files: number; sizeKB: number; maxKB: number; disabled: boolean };
 
   /** Adaptive TTL statistics — present only when `adaptiveTtl` is enabled */
   adaptiveTtl?: {
@@ -595,4 +595,102 @@ export interface CacheOptions {
    * Default: `5000`.
    */
   adaptiveTtlMaxKeys?: number;
+
+  // ── Worker-thread serialization offload ────────────────────────────────────
+  /**
+   * When `true`, tricache spawns a pool of worker threads and offloads AES-GCM
+   * encryption and decryption for large payloads to those threads, keeping the
+   * V8 main event loop free for concurrent HTTP requests.
+   *
+   * Only takes effect when `encryptionKey` is set — plaintext payloads are never
+   * serialized off-thread because `JSON.stringify/parse` is already fast.
+   *
+   * Default: `false`. Enable in long-running servers that write multi-megabyte
+   * encrypted payloads and observe event-loop latency spikes.
+   */
+  workerThreads?: boolean;
+  /**
+   * Byte threshold above which an L2 payload is offloaded to a worker thread
+   * for encryption / decryption. Payloads smaller than this are processed
+   * synchronously (IPC overhead would exceed the savings).
+   * Default: `131072` (128 KB).
+   */
+  workerThresholdBytes?: number;
+  /**
+   * Number of worker threads in the pool.
+   * Default: `Math.min(4, os.availableParallelism())`.
+   */
+  workerPoolSize?: number;
+
+  // ── Backplane staleness fence ───────────────────────────────────────────────
+  /**
+   * Maximum milliseconds the Redis Pub/Sub subscriber is allowed to be
+   * disconnected before tricache considers its L1 entries potentially stale.
+   *
+   * When the subscriber reconnects after a gap longer than this value, all L1
+   * entries that were written *before* the disconnect started are evicted.
+   * This prevents the instance from silently serving data that peers may have
+   * invalidated while the backplane connection was down.
+   *
+   * Set to `0` to disable the fence entirely (accept eventual-consistency drift).
+   * Default: `5000` (5 seconds).
+   */
+  backplaneMaxStalenessMs?: number;
+
+  // ── Disk tier ─────────────────────────────────────────────────────────────
+  /**
+   * Explicitly disable the L1.5 disk spill tier and cold-start snapshots.
+   *
+   * Tricache auto-detects common serverless / ephemeral-filesystem runtimes
+   * (AWS Lambda, Google Cloud Run, Google Cloud Functions, Azure Functions,
+   * Fly.io) and disables the disk tier automatically. Set this to `false` to
+   * override that detection and force the disk tier on regardless of runtime.
+   *
+   * When disabled:
+   *  - L1 evictions are dropped instead of being spilled to disk.
+   *  - Cold-start snapshot persistence is skipped.
+   *  - The `disk` metrics field still appears but shows zeroed counters.
+   *
+   * Default: `undefined` (auto-detect).
+   */
+  disableDisk?: boolean;
+
+  // ── Redis Cluster / Sentinel ───────────────────────────────────────────────
+  /**
+   * Redis Cluster node list. When provided, tricache connects using ioredis
+   * `Cluster` mode with automatic slot routing and multi-node connection
+   * pooling — no external proxy required.
+   *
+   * Takes precedence over `redisHost`/`redisPort`.
+   *
+   * @example
+   * redisClusterNodes: [
+   *   { host: 'redis-1.internal', port: 6379 },
+   *   { host: 'redis-2.internal', port: 6379 },
+   *   { host: 'redis-3.internal', port: 6379 },
+   * ]
+   */
+  redisClusterNodes?: Array<{ host: string; port: number }>;
+
+  /**
+   * Redis Sentinel configuration for high-availability setups.
+   * When provided, tricache connects through Sentinel for automatic
+   * primary failover — no static `redisHost` / `redisPort` needed.
+   *
+   * Takes precedence over `redisHost`/`redisPort` (but not over `redisClusterNodes`).
+   *
+   * @example
+   * redisSentinel: {
+   *   name: 'mymaster',
+   *   sentinels: [
+   *     { host: 'sentinel-1.internal', port: 26379 },
+   *     { host: 'sentinel-2.internal', port: 26379 },
+   *   ],
+   * }
+   */
+  redisSentinel?: {
+    /** Logical name of the monitored master. Must match the Sentinel `monitor` config. */
+    name:      string;
+    sentinels: Array<{ host: string; port: number }>;
+  };
 }

@@ -37,16 +37,16 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
-    "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "build": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "node --expose-gc --import tsx/esm bench/benchmark.ts"
   },
   "dependencies": {
-    "ioredis": "^5.3.2",
-    "msgpackr": "^2.0.1"
+    "ioredis": "^5.11.0",
+    "msgpackr": "^2.0.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

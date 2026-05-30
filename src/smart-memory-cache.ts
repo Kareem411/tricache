@@ -729,7 +729,48 @@ export class SmartMemoryCache {
     return cleaned;
   }
 
-  // ── Snapshot import/export ────────────────────────────────────────────────
+  /**
+   * Evict all non-CRITICAL L1 entries that were written before `cutoffMs`.
+   *
+   * Called by the backplane staleness fence when the Pub/Sub subscriber
+   * reconnects after a disconnect gap that exceeded `backplaneMaxStalenessMs`.
+   * Entries written before the disconnect started may have been invalidated by
+   * peers while the backplane was down; evicting them forces a controlled
+   * cold-start re-fetch from L2 rather than serving silently stale data.
+   *
+   * Write-time is approximated as `entry.expiresAt - entry.ttlMs`.
+   * Entries with no stored `ttlMs` (e.g. legacy snapshot imports) are evicted
+   * conservatively.
+   *
+   * @param cutoffMs - Unix timestamp in milliseconds; entries written before
+   *                   this time are evicted.
+   * @returns Number of entries evicted.
+   */
+  evictSetBefore(cutoffMs: number): number {
+    let evicted = 0;
+    for (const [key, entry] of this.cache) {
+      // Never evict live CRITICAL entries — auth tokens, active sessions, etc.
+      if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > Date.now()) continue;
+
+      // Approximate write-time from the stored TTL.  When ttlMs is missing
+      // (legacy import), treat the entry as potentially stale.
+      const setAt = (entry.ttlMs != null)
+        ? entry.expiresAt - entry.ttlMs
+        : 0; // unknown → assume stale
+
+      if (setAt < cutoffMs) {
+        this._delete(key, 'manual');
+        evicted++;
+      }
+    }
+    if (evicted > 0) {
+      this.bloom.rebuild(this.cache.keys());
+      this._bloomDirtyCount = 0;
+    }
+    return evicted;
+  }
+
+
 
   exportEntries(forbiddenPrefixes: readonly string[]): Array<{ key: string; entry: SmartCacheEntry }> {
     const now = Date.now();

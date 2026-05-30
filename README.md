@@ -713,6 +713,125 @@ CacheService.create({
 
 ---
 
+## 🧵 Worker thread crypto offload
+
+By default, AES-GCM encryption/decryption runs synchronously on the V8 main thread. For payloads above a configurable size threshold this blocks the event loop for measurable durations. Enable worker thread offload to move encryption off the main thread:
+
+```typescript
+CacheService.create({
+  encryptionKey:        process.env.CACHE_ENCRYPTION_KEY,
+  workerThreads:        true,    // enable off-main-thread crypto
+  workerThresholdBytes: 131_072, // only offload payloads ≥ 128 KB (default)
+  workerPoolSize:       4,       // threads; 0 = auto (min(4, logical CPUs))
+});
+```
+
+**How it works:**
+- A fixed-size pool of Node.js `worker_threads` is created at startup; each worker holds an initialised `CacheEncryption` instance.
+- Dispatch is round-robin; inter-thread IPC carries only strings (structured-clone fast path).
+- Workers are `unref()`'d — they do not prevent the process from exiting cleanly.
+- If worker initialisation fails the pool is silently disabled and synchronous crypto is used as a fallback — zero configuration required in environments where workers are unavailable.
+
+**When to enable:**
+- Payloads routinely exceed a few hundred KB with encryption enabled.
+- You observe event-loop lag correlated with L2 read/write operations in APM.
+- Rule of thumb: the default 128 KB threshold keeps overhead negligible for typical API response payloads while protecting against multi-MB documents.
+
+---
+
+## 🔁 Backplane staleness fence
+
+Redis Pub/Sub has no delivery guarantees — a subscriber disconnect (network blip, Redis failover, container restart) can cause peer invalidation messages to be silently dropped. Entries written to L1 between the disconnect and reconnect may silently serve stale data.
+
+TriCache tracks when the subscriber disconnects and, on reconnect, compares the gap duration against `backplaneMaxStalenessMs`. If the gap exceeds the threshold, every L1 entry that was written before the disconnect is proactively evicted, forcing a controlled re-fetch from L2 on the next access:
+
+```typescript
+CacheService.create({
+  invalidationBackplane:   true,
+  backplaneMaxStalenessMs: 5_000, // default: evict stale L1 on gaps > 5 s
+});
+```
+
+Setting `backplaneMaxStalenessMs: 0` disables the fence entirely. The eviction count and gap duration are logged at `warn` level on every triggered flush.
+
+---
+
+## ☁️ Serverless / ephemeral disk environments
+
+On Lambda, Cloud Run, Fly.io, Railway, and similar platforms, the filesystem (`os.tmpdir()`) is container-scoped and is wiped on every cold start. Disk spill and cold-start snapshots are therefore useless and waste I/O budget.
+
+TriCache auto-detects serverless runtimes at construction time (zero I/O — environment variable checks only) and automatically disables the disk tier:
+
+| Runtime | Detection env var |
+|---|---|
+| AWS Lambda | `AWS_LAMBDA_FUNCTION_NAME` |
+| Google Cloud Run | `K_SERVICE` |
+| Google Cloud Functions | `FUNCTION_TARGET` |
+| Azure Functions | `WEBSITE_INSTANCE_ID` |
+| Fly.io | `FLY_APP_NAME` |
+| Railway | `RAILWAY_ENVIRONMENT` |
+| Vercel | `VERCEL` |
+
+You can also control disk behaviour explicitly:
+
+```typescript
+// Force-disable disk tier (e.g., when running inside a Docker container with no writable tmpdir)
+CacheService.create({ disableDisk: true });
+
+// Force-enable disk tier even when a serverless env var is present (advanced override)
+CacheService.create({ disableDisk: false });
+```
+
+When disk is disabled:
+- The disk spill callback is a no-op.
+- `disk.load()` / `disk.delete()` / `disk.clear()` are never called.
+- `loadSnapshot()` and `writeSnapshot()` are skipped.
+- The background disk janitor timer is not started.
+- `metrics().disk.disabled` is `true`.
+
+---
+
+## 🔴 Redis Cluster and Sentinel
+
+TriCache supports Redis Cluster (slot-based sharding) and Redis Sentinel (automatic primary failover) via ioredis built-in support.
+
+### Redis Cluster
+
+```typescript
+CacheService.create({
+  redisClusterNodes: [
+    { host: 'redis-node-1.example.com', port: 6379 },
+    { host: 'redis-node-2.example.com', port: 6379 },
+    { host: 'redis-node-3.example.com', port: 6379 },
+  ],
+  redisTls: true,
+});
+```
+
+ioredis handles slot routing, moved/ask redirects, and re-queuing commands during slot migrations transparently. You can list any subset of cluster nodes — ioredis discovers the full topology automatically.
+
+### Redis Sentinel
+
+```typescript
+CacheService.create({
+  redisSentinel: {
+    name: 'mymaster',
+    sentinels: [
+      { host: 'sentinel-1.example.com', port: 26379 },
+      { host: 'sentinel-2.example.com', port: 26379 },
+      { host: 'sentinel-3.example.com', port: 26379 },
+    ],
+  },
+  redisTls: true,
+});
+```
+
+ioredis monitors the current master via the Sentinel topology and transparently reconnects to a new primary after failover. The backplane subscriber is also constructed in the appropriate cluster/sentinel mode.
+
+> `redisHost` / `redisPort` are ignored when `redisClusterNodes` or `redisSentinel` is set. All three topology modes support `redisTls`.
+
+---
+
 ## ⚡ WASM Bloom filter
 
 A 100,000-bit filter with k=7 hash probes:

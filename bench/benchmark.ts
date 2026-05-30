@@ -37,6 +37,7 @@ import os   from 'os';
 import path from 'path';
 import { rmSync, mkdtempSync } from 'fs';
 import { performance as nodePerf } from 'node:perf_hooks';
+import crypto from 'crypto';
 
 // ─── ANSI colour helpers ──────────────────────────────────────────────────────
 
@@ -1956,5 +1957,214 @@ note('Reports event-loop utilisation (ELU) and GC pause events. Event-loop delay
 
 await svc.destroy();
 cleanup(benchDir, evictDir, oomDir, nsADir, nsBDir);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  19. v0.6.1 features — evictSetBefore, disableDisk, worker pool
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── 19a. evictSetBefore — staleness fence (Fix 2 / Fix 4) ────────────────────
+//
+// When the backplane pub/sub socket reconnects after a gap > backplaneMaxStalenessMs,
+// evictSetBefore(disconnectedAt) is called to flush L1 entries written before the gap.
+// The cost is O(entries) for the Map scan + bloom rebuild when entries are evicted.
+// Understanding this cost matters for sizing backplaneMaxStalenessMs vs L1 size.
+
+header('§19a. evictSetBefore — staleness fence flush cost vs L1 size');
+note('O(entries) Map scan + conditional bloom rebuild (only when entries are actually evicted).');
+note('CRITICAL live entries are skipped — they are preserved even during a full flush.');
+note('Two measurements: scan-only (cutoff=0, nothing evicted) vs full flush (Infinity, all evicted).');
+
+for (const [label, count] of [['1 K entries', 1_000], ['5 K entries', 5_000], ['20 K entries', 20_000]] as Array<[string, number]>) {
+  const evL1 = new SmartMemoryCache({
+    maxBytes:   200 * 1024 * 1024,
+    maxEntries: count + 100,
+    categories: { default: { maxEntries: count + 100, maxSizeBytes: 200 * 1024 * 1024 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+  });
+
+  for (let i = 0; i < count; i++) evL1.set(`e:${i}`, { n: i }, 300_000, CachePriority.NORMAL);
+
+  // ── Measurement 1: scan-only (nothing evicted) ────────────────────────
+  // cutoff=0: setAt = expiresAt - ttlMs ≥ 0, so setAt < 0 is never true.
+  // Models the common case: backplane reconnects quickly, all L1 entries are fresh.
+  await bench(
+    `evictSetBefore scan-only, 0 evictions — ${label}`,
+    () => { evL1.evictSetBefore(0); },
+    5_000, 50,
+    'cutoff=0 → setAt≥0 for all entries → pure O(n) Map scan; no bloom rebuild',
+  );
+
+  // ── Measurement 2: full flush (all entries evicted + bloom rebuild) ────
+  // Infinity cutoff: setAt < ∞ always → all entries evicted.
+  // Models a long backplane outage: everything is stale, cache is nuked.
+  // Refill is included in the measured time; annotated accordingly.
+  await bench(
+    `evictSetBefore full flush + refill   — ${label}`,
+    () => {
+      evL1.evictSetBefore(Infinity);
+      for (let i = 0; i < count; i++) evL1.set(`e:${i}`, { n: i }, 300_000, CachePriority.NORMAL);
+    },
+    20, 3,
+    `O(n) scan + bloom rebuild + ${count} set() refill; bloom rebuild dominates at large N`,
+  );
+}
+
+// ── 19b. disableDisk — ephemeral-mode throughput vs disk-enabled ──────────────
+//
+// In serverless/ephemeral environments (Lambda, Cloud Run, Fly.io), disableDisk:true
+// removes all I/O from the hot path. This section quantifies the overhead eliminated.
+
+header('§19b. disableDisk:true vs default — serverless throughput lift');
+note('disableDisk:true skips all disk.save() (L1 spill), disk.load() (L1.5 reads),');
+note('and all disk janitor ticks. Only L1 RAM tier is active.');
+note('Overhead is only visible under L1 eviction pressure (spill path). Hot hits are identical.');
+
+{
+  const ddDiskDir   = makeTempDir();
+  const ddNoDiskDir = makeTempDir();
+
+  const ddWithDisk = CacheService.reset({
+    namespace: 'dd-disk', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
+    l1MaxEntries: 300, l1MaxBytes: 10 * 1024 * 1024,
+    diskCacheDir: ddDiskDir,
+    disableDisk:  false,
+  });
+
+  const ddNoDisk = CacheService.reset({
+    namespace: 'dd-nodisk', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
+    l1MaxEntries: 300, l1MaxBytes: 10 * 1024 * 1024,
+    diskCacheDir: ddNoDiskDir,
+    disableDisk:  true,
+  });
+
+  // Pre-fill both to L1 capacity so every set() triggers eviction (and disk spill for the disk instance)
+  for (let i = 0; i < 300; i++) {
+    await ddWithDisk.set(`pre:${i}`, { n: i }, 300);
+    await ddNoDisk.set(`pre:${i}`, { n: i }, 300);
+  }
+
+  // ── 19b-1. L1 hot hit — identical path, should show no difference ──────
+  header('  19b-1. L1 hot hit — disableDisk has no effect (hit returns from RAM)');
+  note('  The disk.load() path is only reached on an L1 miss. Hot hits are identical.');
+
+  await bench(
+    '  get — L1 hot hit, disk ENABLED',
+    async i => { await ddWithDisk.get(`pre:${i % 300}`, async () => ({ n: i }), 300); },
+    50_000, 500, 'bloom → Map.get → return; disk never reached',
+  );
+
+  await bench(
+    '  get — L1 hot hit, disk DISABLED (disableDisk:true)',
+    async i => { await ddNoDisk.get(`pre:${i % 300}`, async () => ({ n: i }), 300); },
+    50_000, 500, 'same path — no observable difference expected',
+  );
+
+  // ── 19b-2. set under eviction — disk spill (async) is eliminated ────────
+  header('  19b-2. set under eviction — fire-and-forget disk.save() eliminated');
+  note('  Each set() triggers L1 eviction. Evicted entries are spilled to disk (async setImmediate).');
+  note('  With disableDisk:true the spill is a no-op — no I/O queued, no file descriptor opened.');
+  note('  Main-thread cost difference is the setImmediate closure creation + disk.save() path.');
+
+  const diskRes = await bench(
+    '  set — eviction pressure, disk ENABLED  (spill fires async)',
+    async i => { await ddWithDisk.set(`ov:${i}`, { n: i }, 300); },
+    5_000, 100, 'l1.set → evict → setImmediate(disk.save) — I/O async',
+  );
+
+  const noDiskRes = await bench(
+    '  set — eviction pressure, disk DISABLED (spill is no-op)',
+    async i => { await ddNoDisk.set(`ov:${i}`, { n: i }, 300); },
+    5_000, 100, 'l1.set → evict → diskSpill guard check → return',
+  );
+
+  const liftPct = ((diskRes.nsPerOp - noDiskRes.nsPerOp) / diskRes.nsPerOp * 100).toFixed(1);
+  const liftCol = parseFloat(liftPct) > 5 ? C.green : parseFloat(liftPct) > 0 ? C.yellow : C.dim;
+  console.log(
+    `  ${C.dim}  Main-thread savings (eviction path): ${liftCol}${liftPct}%${C.reset}${C.dim}` +
+    ` (disk.save() is async — real I/O savings are in OS file descriptors / syscalls, not latency)${C.reset}`,
+  );
+
+  await ddWithDisk.destroy();
+  await ddNoDisk.destroy();
+  cleanup(ddDiskDir, ddNoDiskDir);
+}
+
+// ── 19c. Worker pool — off-thread AES-GCM vs sync ───────────────────────────
+//
+// Worker thread offload is only beneficial when payloads are large enough to
+// amortise the IPC round-trip (~50–200 µs on Node.js). Below ~64 KB, sync
+// AES-GCM is faster. This section measures the crossover point.
+//
+// Note: workers are spawned from src/serialize-worker.ts via tsx (dev) or
+// from dist/serialize-worker.js (production). The throughput shown here is
+// for a single worker — real usage uses workerPoolSize (default: min(4,CPUs)).
+
+header('§19c. Worker pool — off-thread AES-GCM throughput vs sync (per round-trip)');
+note('IPC round-trip cost amortises at ~64–128 KB (varies by CPU / Node.js version).');
+note('Below threshold: sync AES-GCM wins (no IPC overhead).');
+note('Above threshold: worker offload frees the event loop for concurrent work.');
+note('workerPoolSize=1 here to show per-round-trip cost; pool(4) gives ~4× throughput.');
+
+{
+  const { WorkerPool } = await import('../src/worker-pool.js');
+  const { CacheEncryption: BenchEnc } = await import('../src/encryption.js');
+
+  const key32 = crypto.randomBytes(32).toString('base64');
+  const enc   = new BenchEnc(key32, { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} });
+
+  // Helper: measure sync encrypt+decrypt (main-thread, no worker)
+  const syncRoundTrip = (plaintext: string): void => {
+    const ct = enc.encrypt(plaintext);
+    enc.decrypt(ct);
+  };
+
+  let pool: InstanceType<typeof WorkerPool> | null = null;
+  try {
+    pool = new WorkerPool({
+      keyBase64: key32,
+      mode:      'aes-256-gcm',
+      size:      1, // single worker — measures per-round-trip IPC cost
+    });
+    if (!pool.isAvailable) {
+      pool = null;
+      note('Worker pool unavailable in this environment — run pnpm build first for compiled workers.');
+    }
+  } catch {
+    note('Worker pool init failed — worker benchmark skipped.');
+  }
+
+  for (const [label, sizeBytes] of [
+    ['4 KB',    4 * 1024],
+    ['16 KB',  16 * 1024],
+    ['64 KB',  64 * 1024],
+    ['128 KB', 128 * 1024],
+    ['512 KB', 512 * 1024],
+  ] as Array<[string, number]>) {
+    const plaintext = 'x'.repeat(sizeBytes);
+
+    await bench(
+      `sync AES-256-GCM round-trip   (${label})`,
+      () => { syncRoundTrip(plaintext); },
+      Math.max(500, Math.round(5_000_000 / sizeBytes)), 50,
+      'main-thread encrypt+decrypt; no IPC cost',
+    );
+
+    if (pool?.isAvailable) {
+      await bench(
+        `worker AES-256-GCM round-trip (${label})`,
+        async () => {
+          const ct = await pool!.encrypt(plaintext);
+          await pool!.decrypt(ct);
+        },
+        Math.max(100, Math.round(500_000 / sizeBytes)), 10,
+        'IPC → worker → encrypt → IPC back; use for payloads > workerThresholdBytes',
+      );
+    }
+  }
+
+  await pool?.destroy();
+}
+
 process.exit(0);
+
 

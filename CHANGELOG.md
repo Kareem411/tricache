@@ -5,7 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.0] — 2026-05-25
+## [0.6.1] — 2026-05-27
+
+### Added
+
+- **Worker thread crypto offload (`workerThreads`)** — AES-GCM encryption and decryption can now be offloaded from the V8 main thread to a dedicated `worker_threads` pool (`src/worker-pool.ts` + `src/serialize-worker.ts`). The pool is fixed-size, round-robin dispatched, and auto-sized to `min(4, logical CPUs)` when `workerPoolSize: 0`. Workers are `unref()`'d so they never block process exit. Offload activates only when `enc.isEnabled && payload.length > workerThresholdBytes` (default 128 KB), so small payloads stay on the fast synchronous path with zero overhead. Worker initialisation failure silently falls back to synchronous crypto — no configuration change required.
+
+  | Option | Default | Description |
+  |---|---|---|
+  | `workerThreads` | `false` | Enable off-main-thread AES-GCM offload |
+  | `workerThresholdBytes` | `131072` | Minimum serialized payload size (bytes) to offload |
+  | `workerPoolSize` | `0` | Fixed pool size; `0` = auto (`min(4, CPUs)`) |
+
+- **Backplane staleness fence (`backplaneMaxStalenessMs`)** — The Pub/Sub subscriber now tracks its most-recent disconnect timestamp. On reconnection, if the gap since the disconnect exceeds `backplaneMaxStalenessMs`, every L1 entry written before the disconnect is proactively evicted via `SmartMemoryCache.evictSetBefore()`. This prevents stale cache hits caused by silently dropped peer invalidations during network blips, Redis failovers, or container restarts. Set to `0` to disable the fence. Eviction count and gap duration are logged at `warn` level.
+
+  | Option | Default | Description |
+  |---|---|---|
+  | `backplaneMaxStalenessMs` | `5000` | Gap threshold in ms; staleness fence fires above this |
+
+- **Serverless / ephemeral disk detection (`disableDisk`)** — TriCache now inspects seven well-known environment variables at construction time (zero I/O) to detect AWS Lambda, Google Cloud Run/Functions, Azure Functions, Fly.io, Railway, and Vercel runtimes. When a serverless runtime is detected the disk tier, disk janitor, cold-start snapshots, and the disk spill callback are all silently disabled. The `metrics().disk.disabled` field reflects the current state. The new `disableDisk` option allows explicit override in either direction.
+
+  | Option | Default | Description |
+  |---|---|---|
+  | `disableDisk` | `undefined` (auto) | `true` = always disable; `false` = always enable; `undefined` = auto-detect |
+
+- **Redis Cluster support (`redisClusterNodes`)** — Pass an array of cluster seed nodes and ioredis handles slot routing, MOVED/ASK redirects, and slot-migration re-queuing transparently. The backplane subscriber is also constructed in cluster mode.
+
+  ```typescript
+  CacheService.create({
+    redisClusterNodes: [
+      { host: 'redis-node-1', port: 6379 },
+      { host: 'redis-node-2', port: 6379 },
+    ],
+  });
+  ```
+
+- **Redis Sentinel support (`redisSentinel`)** — Pass sentinel addresses and a master name; ioredis monitors the primary via the sentinel topology and reconnects after failover. The backplane subscriber uses sentinel mode automatically.
+
+  ```typescript
+  CacheService.create({
+    redisSentinel: {
+      name: 'mymaster',
+      sentinels: [{ host: 'sentinel-1', port: 26379 }],
+    },
+  });
+  ```
+
+- **`SmartMemoryCache.evictSetBefore(cutoffMs)`** — New internal method used by the staleness fence. Approximates each entry's write time as `expiresAt - ttlMs` and evicts entries written before `cutoffMs`. `CRITICAL` priority entries that have not yet expired are preserved. Bloom filter is rebuilt after eviction. Returns the number of evicted entries.
+
+### Changed
+
+- `getRedis()` return type widened from `Promise<RedisClient>` to `Promise<AnyRedisClient>` to cover Cluster and Sentinel connections.
+- `this.redis`, `this.redisConnecting`, and `this.subClient` fields are now typed as `AnyRedisClient` (`Redis | Cluster`) to support all three topology modes.
+- `metrics().disk` now includes a `disabled` boolean field alongside the existing stats fields.
+
+### Fixed
+
+- All disk tier call sites (`disk.load`, `disk.delete`, `disk.clear`, `disk.close`) are now guarded by `if (!this._diskDisabled)`, preventing `ENOENT`-class errors on platforms where the disk tier is disabled.
+- `destroy()` now unconditionally drains the worker thread pool (if active) before closing Redis connections, ensuring clean shutdown when `workerThreads` is enabled.
+- `WorkerPool._dispatch()` now calls `worker.ref()` before posting each message and `worker.unref()` once the pending queue drains, so in-flight `pool.encrypt()` / `pool.decrypt()` calls are always awaited correctly in short-lived scripts (benchmarks, CLI tools) without preventing process exit when idle.
+
+### Dependencies
+
+- `ioredis` 5.10.1 → 5.11.0
+- `msgpackr` 2.0.1 → 2.0.2
+
+
 
 ### Added
 
